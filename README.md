@@ -21,9 +21,10 @@ Ansible-orchestrated, Docker Compose-based SOC lab across three hosts. Fill in t
 │   • Shuffle        (port 3001)  — SOAR                          │
 │     └─ webhook → HTTP POST to DFIR-IRIS API                     │
 │   • DFIR-IRIS      (port 4444)  — case management               │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │ agent registration
-┌──────────────────────────────▼──────────────────────────────────┐
+└─────────────────────────────────────────────────────────────────┘
+                               ▲ agent registration / alerts
+                               │
+┌─────────────────────────────────────────────────────────────────┐
 │ LAN Host                                                        │
 │   • FreeIPA    (port 8443)  — LDAP / Kerberos identity          │
 │   • Nextcloud  (port 8888)  — file storage                      │
