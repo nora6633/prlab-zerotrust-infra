@@ -1,0 +1,79 @@
+services:
+  shuffle-frontend:
+    image: ghcr.io/shuffle/shuffle-frontend:latest
+    container_name: shuffle-frontend
+    hostname: shuffle-frontend
+    restart: unless-stopped
+    ports:
+      - "3001:80"
+      - "3443:443"
+    environment:
+      - BACKEND_HOSTNAME={{ wazuh_server_ip }}
+    depends_on:
+      - shuffle-backend
+
+  shuffle-backend:
+    image: ghcr.io/shuffle/shuffle-backend:latest
+    container_name: shuffle-backend
+    hostname: shuffle-backend
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - {{ deploy_base_dir }}/shuffle/apps:/shuffle-apps:z
+      - {{ deploy_base_dir }}/shuffle/files:/shuffle-files:z
+    environment:
+      - SHUFFLE_APP_HOTLOAD_FOLDER={{ deploy_base_dir }}/shuffle/apps
+      - SHUFFLE_FILE_LOCATION={{ deploy_base_dir }}/shuffle/files
+      - BACKEND_HOSTNAME=shuffle-backend
+      - BACKEND_PORT=5001
+      - FRONTEND_URL=http://shuffle-frontend
+      - SHUFFLE_OPENSEARCH_URL=http://shuffle-opensearch:9200
+      - OUTER_HOSTNAME={{ wazuh_server_ip }}
+      - SHUFFLE_DEFAULT_USERNAME={{ shuffle_admin_username }}
+      - SHUFFLE_DEFAULT_PASSWORD={{ shuffle_admin_password }}
+      - SHUFFLE_DEFAULT_APIKEY={{ shuffle_default_apikey }}
+    depends_on:
+      - shuffle-opensearch
+
+  shuffle-orborus:
+    image: ghcr.io/shuffle/shuffle-orborus:latest
+    container_name: shuffle-orborus
+    hostname: shuffle-orborus
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - SHUFFLE_APP_SDK_VERSION=1.1.0
+      - BASE_URL=http://shuffle-backend:5001
+      - DOCKER_API_VERSION=1.40
+      - CLEANUP=true
+      - ENVIRONMENT_NAME=Shuffle
+      - ORG_ID=Shuffle
+    depends_on:
+      - shuffle-backend
+
+  shuffle-opensearch:
+    image: opensearchproject/opensearch:2.12.0
+    container_name: shuffle-opensearch
+    hostname: shuffle-opensearch
+    restart: unless-stopped
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+      - bootstrap.memory_lock=true
+      - discovery.type=single-node
+      - cluster.routing.allocation.disk.threshold_enabled=false
+      - DISABLE_SECURITY_PLUGIN=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - shuffle-opensearch-data:/usr/share/opensearch/data
+
+volumes:
+  shuffle-opensearch-data:

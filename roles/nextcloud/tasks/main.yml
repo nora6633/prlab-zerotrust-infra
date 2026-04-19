@@ -1,0 +1,28 @@
+---
+- name: Create Nextcloud directory
+  file:
+    path: "{{ deploy_base_dir }}/nextcloud"
+    state: directory
+    mode: '0755'
+
+- name: Template Nextcloud docker-compose
+  template:
+    src: docker-compose.yml.j2
+    dest: "{{ deploy_base_dir }}/nextcloud/docker-compose.yml"
+    mode: '0644'
+
+- name: Deploy Nextcloud stack
+  command:
+    cmd: docker compose up -d
+    chdir: "{{ deploy_base_dir }}/nextcloud"
+
+- name: Wait for Nextcloud to be ready
+  uri:
+    url: "http://{{ lan_host_ip }}:8888/status.php"
+    method: GET
+    status_code: 200
+  register: nextcloud_health
+  until: nextcloud_health.status == 200
+  retries: 30
+  delay: 10
+  failed_when: false

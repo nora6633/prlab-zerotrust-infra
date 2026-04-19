@@ -1,0 +1,29 @@
+---
+- name: Create DFIR-IRIS directory
+  file:
+    path: "{{ deploy_base_dir }}/dfir-iris"
+    state: directory
+    mode: '0755'
+
+- name: Template DFIR-IRIS docker-compose
+  template:
+    src: docker-compose.yml.j2
+    dest: "{{ deploy_base_dir }}/dfir-iris/docker-compose.yml"
+    mode: '0644'
+
+- name: Deploy DFIR-IRIS stack
+  command:
+    cmd: docker compose up -d
+    chdir: "{{ deploy_base_dir }}/dfir-iris"
+
+- name: Wait for DFIR-IRIS to be ready
+  uri:
+    url: "https://{{ wazuh_server_ip }}:4444/api/v1/ping"
+    method: GET
+    validate_certs: false
+    status_code: 200
+  register: iris_health
+  until: iris_health.status == 200
+  retries: 30
+  delay: 10
+  failed_when: false

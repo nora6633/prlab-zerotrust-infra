@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""
+Injects the Shuffle integration block into Wazuh's ossec.conf.
+Run inside the wazuh.manager container.
+"""
+config_file = "/var/ossec/etc/ossec.conf"
+
+integration_block = """
+  <integration>
+    <name>custom-shuffle</name>
+    <level>{{ wazuh_alert_min_level }}</level>
+    <alert_format>json</alert_format>
+  </integration>
+"""
+
+with open(config_file) as f:
+    content = f.read()
+
+if "custom-shuffle" in content:
+    print("Shuffle integration already present in ossec.conf — skipping.")
+else:
+    content = content.replace(
+        "</ossec_config>",
+        integration_block + "</ossec_config>",
+    )
+    with open(config_file, "w") as f:
+        f.write(content)
+    print("Shuffle integration block injected into ossec.conf.")

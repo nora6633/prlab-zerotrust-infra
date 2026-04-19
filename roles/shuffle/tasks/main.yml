@@ -1,0 +1,32 @@
+---
+- name: Create Shuffle directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ deploy_base_dir }}/shuffle"
+    - "{{ deploy_base_dir }}/shuffle/apps"
+    - "{{ deploy_base_dir }}/shuffle/files"
+
+- name: Template Shuffle docker-compose
+  template:
+    src: docker-compose.yml.j2
+    dest: "{{ deploy_base_dir }}/shuffle/docker-compose.yml"
+    mode: '0644'
+
+- name: Deploy Shuffle stack
+  command:
+    cmd: docker compose up -d
+    chdir: "{{ deploy_base_dir }}/shuffle"
+
+- name: Wait for Shuffle backend to be ready
+  uri:
+    url: "http://{{ wazuh_server_ip }}:5001/api/v1/health"
+    method: GET
+    status_code: 200
+  register: shuffle_health
+  until: shuffle_health.status == 200
+  retries: 30
+  delay: 10
+  failed_when: false

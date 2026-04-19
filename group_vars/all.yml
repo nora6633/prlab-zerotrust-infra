@@ -1,0 +1,10 @@
+---
+# ── Derived from inventory (do not edit) ───────────────────────────────────
+wazuh_server_ip: "{{ hostvars[groups['soc'][0]]['ansible_host'] }}"
+lan_host_ip:     "{{ hostvars[groups['lan'][0]]['ansible_host'] }}"
+external_host_ip: "{{ hostvars[groups['external'][0]]['ansible_host'] }}"
+
+# ── General ────────────────────────────────────────────────────────────────
+domain: example.lab
+deploy_base_dir: /opt/soc-infra
+wazuh_version: "4.9.2"

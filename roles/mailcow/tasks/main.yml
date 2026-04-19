@@ -1,0 +1,41 @@
+---
+- name: Create Mailcow base directory
+  file:
+    path: "{{ deploy_base_dir }}/mailcow"
+    state: directory
+    mode: '0755'
+
+- name: Clone mailcow-dockerized repository
+  git:
+    repo: https://github.com/mailcow/mailcow-dockerized.git
+    dest: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized"
+    depth: 1
+    force: false
+
+- name: Template mailcow.conf
+  template:
+    src: mailcow.conf.j2
+    dest: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized/mailcow.conf"
+    mode: '0600'
+
+- name: Pull Mailcow images
+  command:
+    cmd: docker compose pull
+    chdir: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized"
+
+- name: Deploy Mailcow stack
+  command:
+    cmd: docker compose up -d
+    chdir: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized"
+
+- name: Wait for Mailcow web interface
+  uri:
+    url: "https://{{ lan_host_ip }}/api/v1/get/status/containers"
+    method: GET
+    validate_certs: false
+    status_code: [200, 401]
+  register: mailcow_health
+  until: mailcow_health.status in [200, 401]
+  retries: 30
+  delay: 15
+  failed_when: false

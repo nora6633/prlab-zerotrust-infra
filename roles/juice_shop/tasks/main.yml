@@ -1,0 +1,17 @@
+---
+- name: Create Juice Shop directory
+  file:
+    path: "{{ deploy_base_dir }}/juice-shop"
+    state: directory
+    mode: '0755'
+
+- name: Template Juice Shop docker-compose
+  template:
+    src: docker-compose.yml.j2
+    dest: "{{ deploy_base_dir }}/juice-shop/docker-compose.yml"
+    mode: '0644'
+
+- name: Deploy OWASP Juice Shop
+  command:
+    cmd: docker compose up -d
+    chdir: "{{ deploy_base_dir }}/juice-shop"

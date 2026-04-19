@@ -1,0 +1,43 @@
+---
+- name: Create Wazuh deployment directory
+  file:
+    path: "{{ deploy_base_dir }}/wazuh"
+    state: directory
+    mode: '0755'
+
+- name: Clone Wazuh Docker repository
+  git:
+    repo: https://github.com/wazuh/wazuh-docker.git
+    dest: "{{ deploy_base_dir }}/wazuh/wazuh-docker"
+    version: "v{{ wazuh_version }}"
+    depth: 1
+    force: false
+
+- name: Generate SSL certificates
+  command:
+    cmd: docker compose -f generate-indexer-certs.yml run --rm generator
+    chdir: "{{ deploy_base_dir }}/wazuh/wazuh-docker/single-node"
+  args:
+    creates: "{{ deploy_base_dir }}/wazuh/wazuh-docker/single-node/config/wazuh_indexer_ssl_certs/wazuh.manager.pem"
+
+- name: Template Wazuh dashboard API config
+  template:
+    src: wazuh.yml.j2
+    dest: "{{ deploy_base_dir }}/wazuh/wazuh-docker/single-node/config/wazuh_dashboard/wazuh.yml"
+    mode: '0644'
+
+- name: Deploy Wazuh single-node stack
+  command:
+    cmd: docker compose up -d
+    chdir: "{{ deploy_base_dir }}/wazuh/wazuh-docker/single-node"
+
+- name: Wait for Wazuh manager API to be healthy
+  uri:
+    url: "https://{{ wazuh_server_ip }}:55000/"
+    method: GET
+    validate_certs: false
+    status_code: 200
+  register: wazuh_api_check
+  until: wazuh_api_check.status == 200
+  retries: 30
+  delay: 10

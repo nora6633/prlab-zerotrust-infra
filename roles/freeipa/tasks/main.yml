@@ -1,0 +1,29 @@
+---
+- name: Create FreeIPA directory
+  file:
+    path: "{{ deploy_base_dir }}/freeipa"
+    state: directory
+    mode: '0755'
+
+- name: Template FreeIPA docker-compose
+  template:
+    src: docker-compose.yml.j2
+    dest: "{{ deploy_base_dir }}/freeipa/docker-compose.yml"
+    mode: '0644'
+
+- name: Deploy FreeIPA
+  command:
+    cmd: docker compose up -d
+    chdir: "{{ deploy_base_dir }}/freeipa"
+
+- name: Wait for FreeIPA web interface
+  uri:
+    url: "https://{{ lan_host_ip }}:8443/ipa/ui/"
+    method: GET
+    validate_certs: false
+    status_code: 200
+  register: freeipa_health
+  until: freeipa_health.status == 200
+  retries: 60
+  delay: 15
+  failed_when: false

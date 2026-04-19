@@ -1,0 +1,22 @@
+---
+# ── Shuffle ────────────────────────────────────────────────────────────────
+shuffle_admin_username: admin
+shuffle_admin_password: "ShuffleAdm1n!"
+# API key used by Ansible and Wazuh integration to authenticate with Shuffle
+shuffle_default_apikey: "CHANGE_ME_shuffle_api_key_min_36_chars!!"
+# Stable IDs for the pre-built workflow (must be valid UUIDs)
+shuffle_workflow_id: "b2c3d4e5-f6a7-8901-bcde-f01234567891"
+shuffle_webhook_trigger_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+# ── DFIR-IRIS ──────────────────────────────────────────────────────────────
+iris_version: "v2.4.18"
+iris_admin_password: "IrisAdm1n!"
+# Set this before running configure_integration.yml — used by Shuffle to call IRIS API
+iris_adm_api_key: "CHANGE_ME_IRIS_ADM_API_KEY_36_CHARS_MIN"
+iris_db_password: "irisDbP@ssw0rd"
+iris_rabbitmq_user: iris
+iris_rabbitmq_password: "irisRabbitP@ss1"
+iris_secret_key: "iris-secret-key-change-me-at-least-32chars!!"
+
+# ── Wazuh integration ──────────────────────────────────────────────────────
+wazuh_alert_min_level: 7

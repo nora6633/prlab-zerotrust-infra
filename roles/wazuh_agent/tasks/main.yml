@@ -1,0 +1,22 @@
+---
+- name: Create Wazuh agent directory
+  file:
+    path: "{{ deploy_base_dir }}/wazuh-agent"
+    state: directory
+    mode: '0755'
+
+- name: Template Wazuh agent docker-compose
+  template:
+    src: docker-compose.yml.j2
+    dest: "{{ deploy_base_dir }}/wazuh-agent/docker-compose.yml"
+    mode: '0644'
+
+- name: Pull Wazuh agent image
+  command:
+    cmd: docker compose pull
+    chdir: "{{ deploy_base_dir }}/wazuh-agent"
+
+- name: Deploy Wazuh agent
+  command:
+    cmd: docker compose up -d
+    chdir: "{{ deploy_base_dir }}/wazuh-agent"

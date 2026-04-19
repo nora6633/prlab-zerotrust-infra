@@ -1,0 +1,102 @@
+---
+# Run AFTER site.yml once all services are up.
+# Wires up: Wazuh alert → Shuffle webhook → DFIR-IRIS case creation.
+#
+# Prerequisites:
+#   - group_vars/soc.yml: shuffle_default_apikey and iris_adm_api_key are set
+#   - Wazuh, Shuffle, and DFIR-IRIS containers are running on the SOC host
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini configure_integration.yml
+
+- name: Configure Wazuh → Shuffle → DFIR-IRIS integration
+  hosts: soc
+  become: true
+  gather_facts: true
+
+  tasks:
+    # ── Shuffle: import workflow ──────────────────────────────────────────
+    - name: Ensure Shuffle backend is reachable
+      uri:
+        url: "http://{{ wazuh_server_ip }}:5001/api/v1/health"
+        method: GET
+        status_code: 200
+      register: shuffle_health
+      until: shuffle_health.status == 200
+      retries: 12
+      delay: 5
+
+    - name: Template Wazuh-to-IRIS workflow JSON onto host
+      template:
+        src: roles/shuffle/templates/wazuh_iris_workflow.json.j2
+        dest: "{{ deploy_base_dir }}/shuffle/wazuh_iris_workflow.json"
+        mode: '0644'
+
+    - name: Import workflow into Shuffle via API
+      uri:
+        url: "http://{{ wazuh_server_ip }}:5001/api/v1/workflows"
+        method: POST
+        body_format: json
+        body: "{{ lookup('template', 'roles/shuffle/templates/wazuh_iris_workflow.json.j2') | from_json }}"
+        headers:
+          Authorization: "Bearer {{ shuffle_default_apikey }}"
+        validate_certs: false
+        status_code: [200, 201]
+      register: workflow_import
+      failed_when: workflow_import.status not in [200, 201]
+
+    # ── Wazuh: install custom integration ────────────────────────────────
+    - name: Template custom-shuffle integration script
+      template:
+        src: roles/wazuh_server/templates/custom-shuffle.py.j2
+        dest: /tmp/custom-shuffle
+        mode: '0755'
+
+    - name: Copy integration script into wazuh.manager container
+      command: docker cp /tmp/custom-shuffle wazuh.manager:/var/ossec/integrations/custom-shuffle
+
+    - name: Set ownership and permissions on integration script
+      command: >
+        docker exec wazuh.manager sh -c
+        "chown root:wazuh /var/ossec/integrations/custom-shuffle &&
+         chmod 750 /var/ossec/integrations/custom-shuffle"
+
+    - name: Template ossec.conf injection script
+      template:
+        src: roles/wazuh_server/templates/inject_integration.py.j2
+        dest: /tmp/inject_integration.py
+        mode: '0755'
+
+    - name: Copy injection script into wazuh.manager container
+      command: docker cp /tmp/inject_integration.py wazuh.manager:/tmp/inject_integration.py
+
+    - name: Inject Shuffle integration block into ossec.conf
+      command: docker exec wazuh.manager python3 /tmp/inject_integration.py
+      register: inject_result
+
+    - name: Show injection result
+      debug:
+        msg: "{{ inject_result.stdout }}"
+
+    - name: Restart wazuh.manager to apply integration config
+      command: docker restart wazuh.manager
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    - name: Print integration summary
+      debug:
+        msg:
+          - "Integration configured successfully!"
+          - ""
+          - "Data flow:"
+          - "  Wazuh alert (level >= {{ wazuh_alert_min_level }})"
+          - "    → Shuffle webhook: http://{{ wazuh_server_ip }}:5001/api/v1/hooks/{{ shuffle_webhook_trigger_id }}"
+          - "    → DFIR-IRIS case:  https://{{ wazuh_server_ip }}:4444"
+          - ""
+          - "Service endpoints:"
+          - "  Wazuh dashboard : https://{{ wazuh_server_ip }}"
+          - "  Shuffle UI      : http://{{ wazuh_server_ip }}:3001"
+          - "  DFIR-IRIS       : https://{{ wazuh_server_ip }}:4444"
+          - "  Juice Shop      : http://{{ external_host_ip }}:3000"
+          - "  Nextcloud       : http://{{ lan_host_ip }}:8888"
+          - "  FreeIPA         : https://{{ lan_host_ip }}:8443"
+          - "  Mailcow         : https://{{ lan_host_ip }}"

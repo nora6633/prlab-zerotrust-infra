@@ -1,0 +1,40 @@
+---
+# Steps:
+#   1. Fill in host IPs in inventory/hosts.ini
+#   2. Review/change passwords in group_vars/soc.yml and group_vars/lan.yml
+#   3. ansible-playbook -i inventory/hosts.ini site.yml
+#   4. ansible-playbook -i inventory/hosts.ini configure_integration.yml
+
+- name: Install Docker on all hosts
+  hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - common
+
+- name: Deploy SOC services
+  hosts: soc
+  become: true
+  gather_facts: true
+  roles:
+    - wazuh_server
+    - shuffle
+    - dfir_iris
+
+- name: Deploy external services
+  hosts: external
+  become: true
+  gather_facts: true
+  roles:
+    - wazuh_agent
+    - juice_shop
+
+- name: Deploy LAN services
+  hosts: lan
+  become: true
+  gather_facts: true
+  roles:
+    - wazuh_agent
+    - freeipa
+    - nextcloud
+    - mailcow

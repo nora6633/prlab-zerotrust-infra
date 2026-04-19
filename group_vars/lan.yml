@@ -1,0 +1,20 @@
+---
+# ── FreeIPA ────────────────────────────────────────────────────────────────
+freeipa_realm: "{{ domain | upper }}"
+freeipa_admin_password: "FreeIPA_Adm1n!"
+freeipa_ds_password: "FreeIPA_DS_P@ss1"
+
+# ── Nextcloud ──────────────────────────────────────────────────────────────
+nextcloud_admin_user: admin
+nextcloud_admin_password: "Nextcloud@dmin1"
+nextcloud_db_name: nextcloud
+nextcloud_db_user: nextcloud
+nextcloud_db_password: "NcDbP@ss1"
+nextcloud_db_root_password: "NcRootP@ss1"
+
+# ── Mailcow ────────────────────────────────────────────────────────────────
+mailcow_db_name: mailcow
+mailcow_db_user: mailcow
+mailcow_db_password: "MailcowDbP@ss1"
+mailcow_db_root_password: "MailcowRootP@ss1"
+mailcow_redis_password: "MailcowRedisP@ss1"
