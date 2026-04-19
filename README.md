@@ -5,6 +5,7 @@ Ansible-orchestrated, Docker Compose-based SOC lab across three hosts. Fill in t
 ---
 
 ## Architecture
+<img width="2252" height="844" alt="image" src="https://github.com/user-attachments/assets/16eac631-446d-48bb-85fc-bcee39264b8a" />
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
