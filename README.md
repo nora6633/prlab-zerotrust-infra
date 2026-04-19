@@ -73,11 +73,30 @@ Wazuh Manager
 
 ---
 
+## Host Specifications
+
+| Host | Services | Min RAM | Recommended RAM | Min CPU | Disk |
+|---|---|---|---|---|---|
+| **SOC** | Wazuh server (manager + indexer + dashboard) + Shuffle (backend + OpenSearch) + DFIR-IRIS | 8 GB | 16 GB | 4 cores | 50 GB |
+| **LAN** | FreeIPA + Nextcloud + Mailcow + Wazuh agent | 4 GB | 8 GB | 2 cores | 50 GB |
+| **External** | Juice Shop + Wazuh agent | 1 GB | 2 GB | 1 core | 20 GB |
+
+> The SOC host is the most resource-intensive — it runs two separate OpenSearch instances (Wazuh indexer + Shuffle's OpenSearch), each needing at least 1 GB JVM heap, on top of Wazuh manager, dashboard, and DFIR-IRIS. 8 GB is the floor; 16 GB is recommended for a stable lab.
+
+---
+
 ## Prerequisites
 
 - Ansible ≥ 2.14 on the control node
 - SSH key access to all 3 hosts
 - Target hosts: Ubuntu 24.04, min 4 GB RAM each (SOC host: 8 GB recommended)
+- Passwordless sudo on all 3 hosts (Ansible uses `become: true` throughout)
+
+Grant passwordless sudo to the ansible user on each host:
+
+```bash
+echo '<your-user> ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/<your-user>
+```
 
 Install required Ansible collections:
 
