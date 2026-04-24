@@ -1,0 +1,8 @@
+services:
+  unbound-mailcow:
+    healthcheck:
+      test: ["CMD", "sh", "-c", "pgrep unbound > /dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

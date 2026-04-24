@@ -15,6 +15,16 @@
   command:
     cmd: docker compose up -d
     chdir: "{{ deploy_base_dir }}/freeipa"
+  register: freeipa_deploy
+  failed_when: >
+    freeipa_deploy.rc != 0 and
+    'AlreadyExists' not in (freeipa_deploy.stderr | default(''))
+
+- name: Force-recreate FreeIPA if stale container state
+  command:
+    cmd: docker compose up -d --force-recreate
+    chdir: "{{ deploy_base_dir }}/freeipa"
+  when: "'AlreadyExists' in (freeipa_deploy.stderr | default(''))"
 
 - name: Wait for FreeIPA web interface
   uri:

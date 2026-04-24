@@ -11,12 +11,32 @@
     dest: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized"
     depth: 1
     force: false
+    update: false
 
 - name: Template mailcow.conf
   template:
     src: mailcow.conf.j2
     dest: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized/mailcow.conf"
     mode: '0600'
+
+- name: Template Mailcow docker-compose override (relaxed unbound healthcheck)
+  template:
+    src: docker-compose.override.yml.j2
+    dest: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized/docker-compose.override.yml"
+    mode: '0644'
+
+- name: Disable systemd-resolved stub listener (conflicts with Mailcow unbound on port 53)
+  lineinfile:
+    path: /etc/systemd/resolved.conf
+    regexp: '^#?DNSStubListener='
+    line: 'DNSStubListener=no'
+  register: resolved_conf
+
+- name: Restart systemd-resolved to apply stub listener change
+  systemd:
+    name: systemd-resolved
+    state: restarted
+  when: resolved_conf.changed
 
 - name: Pull Mailcow images
   command:

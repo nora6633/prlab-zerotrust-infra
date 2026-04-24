@@ -20,13 +20,9 @@
     cmd: docker compose up -d
     chdir: "{{ deploy_base_dir }}/shuffle"
 
-- name: Wait for Shuffle backend to be ready
-  uri:
-    url: "http://{{ wazuh_server_ip }}:5001/api/v1/health"
-    method: GET
-    status_code: 200
-  register: shuffle_health
-  until: shuffle_health.status == 200
-  retries: 30
-  delay: 10
-  failed_when: false
+- name: Wait for Shuffle backend port to be ready
+  wait_for:
+    host: "{{ wazuh_server_ip }}"
+    port: 5001
+    timeout: 300
+    delay: 10

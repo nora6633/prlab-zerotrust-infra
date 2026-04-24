@@ -110,21 +110,25 @@ ansible-galaxy collection install community.docker community.general
 
 ### 1. Set host IPs
 
-Edit `inventory/hosts.ini`:
+**Option A — environment variables (recommended):**
 
-```ini
-[external]
-external-host ansible_host=<EXTERNAL_HOST_IP> ansible_user=ubuntu
-
-[soc]
-soc-host ansible_host=<SOC_HOST_IP> ansible_user=ubuntu
-
-[lan]
-lan-host ansible_host=<LAN_HOST_IP> ansible_user=ubuntu
-
-[all:vars]
-ansible_ssh_private_key_file=~/.ssh/id_rsa
+```bash
+export EXTERNAL_HOST_IP=10.8.0.12
+export SOC_HOST_IP=10.8.0.13
+export LAN_HOST_IP=10.8.0.14
+export ANSIBLE_USER=ubuntu           # optional, default: ubuntu
+export ANSIBLE_SSH_KEY=~/.ssh/id_rsa # optional, default: ~/.ssh/id_rsa
 ```
+
+Then use the dynamic inventory script for all playbook commands:
+
+```bash
+ansible-playbook -i inventory/hosts.py site.yml
+```
+
+**Option B — static file:**
+
+Edit `inventory/hosts.ini` directly and use `-i inventory/hosts.ini`.
 
 All service configs (Wazuh agent → manager IP, Shuffle webhook URLs, etc.) are derived automatically from these three IPs — no other files need to be touched for a basic deployment.
 
