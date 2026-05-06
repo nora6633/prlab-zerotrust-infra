@@ -1,0 +1,12 @@
+---
+# Resume a partial SOC deployment by skipping Wazuh server (already running) and
+# only running Shuffle + DFIR-IRIS. Useful when site.yml fails partway through
+# the SOC play and you don't want to re-run the heavy Wazuh stack.
+
+- name: Deploy Shuffle and DFIR-IRIS
+  hosts: soc
+  become: true
+  gather_facts: true
+  roles:
+    - shuffle
+    - dfir_iris

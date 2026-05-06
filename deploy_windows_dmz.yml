@@ -1,0 +1,157 @@
+---
+# Deploys OWASP Juice Shop + Wazuh Agent on a Windows DMZ host.
+# Use this INSTEAD of the `external` play in site.yml when the external host is Windows.
+#
+# Prerequisites on the Windows target:
+#   - WinRM enabled (Enable-PSRemoting -Force) and reachable on TCP/5985
+#   - An admin user with credentials configured in inventory
+#   - Internet access (for Chocolatey, Wazuh MSI, Juice Shop release zip)
+#
+# Required Ansible collections:
+#   ansible-galaxy collection install ansible.windows community.windows chocolatey.chocolatey
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini deploy_windows_dmz.yml
+
+- name: Deploy Windows DMZ - Juice Shop + Wazuh Agent
+  hosts: external
+  gather_facts: false
+
+  vars:
+    wazuh_manager_ip: "{{ wazuh_server_ip }}"
+    agent_name: "dmz-windows"
+    juice_shop_port: 3000
+    juice_shop_version: "19.2.1"
+    install_dir: 'C:\soc-infra'
+
+  tasks:
+    - name: Create soc-infra directory
+      ansible.windows.win_file:
+        path: "{{ install_dir }}"
+        state: directory
+
+    - name: Install Chocolatey
+      ansible.windows.win_shell: |
+        Set-ExecutionPolicy Bypass -Scope Process -Force
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+        Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+      args:
+        creates: 'C:\ProgramData\chocolatey\bin\choco.exe'
+
+    - name: Install Node.js LTS
+      chocolatey.chocolatey.win_chocolatey:
+        name: nodejs-lts
+        state: present
+
+    - name: Install NSSM (service manager)
+      chocolatey.chocolatey.win_chocolatey:
+        name: nssm
+        state: present
+
+    - name: Download OWASP Juice Shop release
+      ansible.windows.win_get_url:
+        url: "https://github.com/juice-shop/juice-shop/releases/download/v{{ juice_shop_version }}/juice-shop-{{ juice_shop_version }}_node24_win32_x64.zip"
+        dest: "{{ install_dir }}\\juice-shop.zip"
+        force: false
+
+    - name: Extract Juice Shop
+      community.windows.win_unzip:
+        src: "{{ install_dir }}\\juice-shop.zip"
+        dest: "{{ install_dir }}"
+        creates: "{{ install_dir }}\\juice-shop_{{ juice_shop_version }}"
+
+    - name: Register Juice Shop as a Windows service via NSSM
+      ansible.windows.win_shell: |
+        $nodePath = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
+        if (-not $nodePath) { $nodePath = "C:\Program Files\nodejs\node.exe" }
+        $appDir  = "{{ install_dir }}\juice-shop_{{ juice_shop_version }}"
+        $appPath = "$appDir\app.js"
+        $status = nssm status JuiceShop 2>&1
+        if ($status -notmatch "SERVICE_") {
+          nssm install JuiceShop "$nodePath" "$appPath"
+        }
+        nssm set JuiceShop AppDirectory "$appDir"
+        nssm set JuiceShop AppEnvironmentExtra "NODE_ENV=unsafe PORT={{ juice_shop_port }}"
+        nssm set JuiceShop DisplayName "OWASP Juice Shop"
+        nssm set JuiceShop Start SERVICE_AUTO_START
+        nssm start JuiceShop 2>&1
+        exit 0
+
+    - name: Ensure Juice Shop service is running
+      ansible.windows.win_shell: |
+        $svc = Get-Service JuiceShop -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne "Running") {
+          nssm start JuiceShop 2>&1 | Out-Null
+          Start-Sleep 3
+        }
+        (Get-Service JuiceShop).Status
+      ignore_errors: true
+
+    - name: Download Wazuh Agent MSI
+      ansible.windows.win_get_url:
+        url: "https://packages.wazuh.com/4.x/windows/wazuh-agent-{{ wazuh_version }}-1.msi"
+        dest: "{{ install_dir }}\\wazuh-agent-{{ wazuh_version }}-1.msi"
+        force: false
+
+    - name: Install Wazuh Agent
+      ansible.windows.win_shell: |
+        $msi = "{{ install_dir }}\wazuh-agent-{{ wazuh_version }}-1.msi"
+        $args = @(
+          "/i", $msi,
+          "WAZUH_MANAGER={{ wazuh_manager_ip }}",
+          "WAZUH_AGENT_NAME={{ agent_name }}",
+          "WAZUH_REGISTRATION_SERVER={{ wazuh_manager_ip }}",
+          "/quiet", "/norestart"
+        )
+        $p = Start-Process msiexec -ArgumentList $args -Wait -PassThru
+        if ($p.ExitCode -ne 0) { throw "msiexec failed with exit code $($p.ExitCode)" }
+      args:
+        creates: 'C:\Program Files (x86)\ossec-agent\wazuh-agent.exe'
+
+    - name: Start Wazuh Agent service
+      ansible.windows.win_service:
+        name: WazuhSvc
+        state: started
+        start_mode: auto
+
+    - name: Allow Juice Shop inbound (port 3000)
+      community.windows.win_firewall_rule:
+        name: "Juice Shop HTTP"
+        localport: "{{ juice_shop_port }}"
+        action: allow
+        direction: in
+        protocol: tcp
+        state: present
+        enabled: true
+
+    - name: Allow Wazuh agent outbound to manager
+      community.windows.win_firewall_rule:
+        name: "Wazuh Agent Outbound"
+        remoteip: "{{ wazuh_manager_ip }}"
+        remoteport: "1514,1515"
+        action: allow
+        direction: out
+        protocol: tcp
+        state: present
+        enabled: true
+
+    - name: Wait for Juice Shop port to be listening
+      ansible.windows.win_wait_for:
+        port: "{{ juice_shop_port }}"
+        timeout: 60
+      ignore_errors: true
+
+    - name: Check Wazuh service status
+      ansible.windows.win_service:
+        name: WazuhSvc
+      register: wazuh_svc
+
+    - name: Deployment summary
+      debug:
+        msg:
+          - "================================================"
+          - " Windows DMZ Deployment Complete"
+          - "================================================"
+          - " Juice Shop  -> http://{{ ansible_host }}:{{ juice_shop_port }}"
+          - " Wazuh Agent -> {{ wazuh_svc.state }} (manager: {{ wazuh_manager_ip }})"
+          - "================================================"
