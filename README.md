@@ -9,7 +9,7 @@ Ansible-orchestrated, Docker Compose-based SOC lab across three hosts. Fill in t
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ External Host                                                   │
+│ External Host  (Linux OR Windows DMZ)                           │
 │   • OWASP Juice Shop  (port 3000)  — intentionally vulnerable   │
 │   • Wazuh Agent       (host mode)  — monitors this host         │
 └──────────────────────────────┬──────────────────────────────────┘
@@ -67,8 +67,12 @@ Wazuh Manager
 │   ├── freeipa/                         ← FreeIPA identity server
 │   ├── nextcloud/                       ← Nextcloud + MariaDB
 │   └── mailcow/                         ← Mailcow mail server suite
-├── site.yml                             ← deploy all services
-└── configure_integration.yml           ← wire Wazuh → Shuffle → IRIS
+├── windows-dmz/
+│   └── setup-dmz.ps1                    ← manual PowerShell fallback (no Ansible)
+├── site.yml                             ← deploy all services (Linux external)
+├── deploy_windows_dmz.yml               ← deploy external host as Windows DMZ
+├── deploy_soc_remaining.yml             ← resume partial SOC deploy (Shuffle + IRIS)
+└── configure_integration.yml            ← wire Wazuh → Shuffle → IRIS
 ```
 
 ---
@@ -79,7 +83,8 @@ Wazuh Manager
 |---|---|---|---|---|---|
 | **SOC** | Wazuh server (manager + indexer + dashboard) + Shuffle (backend + OpenSearch) + DFIR-IRIS | 8 GB | 16 GB | 4 cores | 50 GB |
 | **LAN** | FreeIPA + Nextcloud + Mailcow + Wazuh agent | 4 GB | 8 GB | 2 cores | 50 GB |
-| **External** | Juice Shop + Wazuh agent | 1 GB | 2 GB | 1 core | 20 GB |
+| **External (Linux)** | Juice Shop + Wazuh agent | 1 GB | 2 GB | 1 core | 20 GB |
+| **External (Windows DMZ)** | Juice Shop (NSSM) + Wazuh agent (MSI) | 2 GB | 4 GB | 2 cores | 30 GB |
 
 > The SOC host is the most resource-intensive — it runs two separate OpenSearch instances (Wazuh indexer + Shuffle's OpenSearch), each needing at least 1 GB JVM heap, on top of Wazuh manager, dashboard, and DFIR-IRIS. 8 GB is the floor; 16 GB is recommended for a stable lab.
 
@@ -102,6 +107,21 @@ Install required Ansible collections:
 
 ```bash
 ansible-galaxy collection install community.docker community.general
+```
+
+For the Windows DMZ option additionally install:
+
+```bash
+ansible-galaxy collection install ansible.windows community.windows chocolatey.chocolatey
+pip install pywinrm
+```
+
+The Windows target must have WinRM enabled and reachable on TCP/5985:
+
+```powershell
+Enable-PSRemoting -Force
+Set-Item WSMan:\localhost\Service\Auth\Basic $true
+Set-Item WSMan:\localhost\Service\AllowUnencrypted $true   # lab only
 ```
 
 ---
@@ -159,6 +179,20 @@ This runs four plays in order:
 3. **external** — Wazuh agent, Juice Shop
 4. **lan** — Wazuh agent, FreeIPA, Nextcloud, Mailcow
 
+**Windows DMZ external host?** Skip the `external` play in `site.yml` and run the dedicated Windows playbook instead — it installs Juice Shop as a Windows service via NSSM and the Wazuh agent via MSI, configures the firewall, and registers the agent with the manager:
+
+```bash
+ansible-playbook -i inventory/hosts.ini deploy_windows_dmz.yml
+```
+
+**SOC deploy failed mid-way?** Re-run only the parts that haven't completed (skips Wazuh server, runs Shuffle + DFIR-IRIS):
+
+```bash
+ansible-playbook -i inventory/hosts.ini deploy_soc_remaining.yml
+```
+
+> No Ansible at all on the Windows side? Run `windows-dmz/setup-dmz.ps1` directly on the DMZ host as Administrator — it does the same install via Chocolatey + Docker Desktop.
+
 ### 4. Wire up the alert pipeline
 
 ```bash
@@ -180,7 +214,7 @@ This playbook:
 | Wazuh Dashboard | SOC | `https://<SOC_IP>` |
 | Shuffle | SOC | `http://<SOC_IP>:3001` |
 | DFIR-IRIS | SOC | `https://<SOC_IP>:4444` |
-| Juice Shop | External | `http://<EXTERNAL_IP>:3000` |
+| Juice Shop | External (Linux or Windows DMZ) | `http://<EXTERNAL_IP>:3000` |
 | FreeIPA | LAN | `https://<LAN_IP>:8443` |
 | Nextcloud | LAN | `http://<LAN_IP>:8888` |
 | Mailcow | LAN | `https://<LAN_IP>` |
