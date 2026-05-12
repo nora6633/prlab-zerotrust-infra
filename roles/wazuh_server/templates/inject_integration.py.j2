@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Injects the Shuffle integration block into Wazuh's ossec.conf.
-Run inside the wazuh.manager container.
+Injects the Shuffle integration block into Wazuh's host-side wazuh_manager.conf.
+Modifications to /var/ossec/etc/ossec.conf inside the container do NOT survive
+restarts — the entrypoint copies wazuh_manager.conf back into place each time.
+Run on the SOC host (not via docker exec).
 """
-config_file = "/var/ossec/etc/ossec.conf"
+config_file = "{{ wazuh_manager_host_conf }}"
 
 integration_block = """
   <integration>
@@ -19,9 +21,12 @@ with open(config_file) as f:
 if "custom-shuffle" in content:
     print("Shuffle integration already present in ossec.conf — skipping.")
 else:
+    # count=1 so we only insert before the FIRST </ossec_config> (the main config block;
+    # ossec.conf typically has a second block dedicated to active-responses.log).
     content = content.replace(
         "</ossec_config>",
         integration_block + "</ossec_config>",
+        1,
     )
     with open(config_file, "w") as f:
         f.write(content)

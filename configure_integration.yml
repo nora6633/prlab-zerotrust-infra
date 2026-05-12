@@ -67,11 +67,8 @@
         dest: /tmp/inject_integration.py
         mode: '0755'
 
-    - name: Copy injection script into wazuh.manager container
-      command: docker cp /tmp/inject_integration.py wazuh.manager:/tmp/inject_integration.py
-
-    - name: Inject Shuffle integration block into ossec.conf
-      command: docker exec wazuh.manager python3 /tmp/inject_integration.py
+    - name: Inject Shuffle integration block into host-side wazuh_manager.conf
+      command: python3 /tmp/inject_integration.py
       register: inject_result
 
     - name: Show injection result
