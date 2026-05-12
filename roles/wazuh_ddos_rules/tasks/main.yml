@@ -1,0 +1,39 @@
+---
+- name: Copy nginx decoder into manager container
+  shell: |
+    docker cp {{ role_path }}/files/local_decoder_nginx.xml \
+      single-node-wazuh.manager-1:/var/ossec/etc/decoders/local_decoder_nginx.xml
+    docker exec single-node-wazuh.manager-1 \
+      chown wazuh:wazuh /var/ossec/etc/decoders/local_decoder_nginx.xml
+
+- name: Copy DDoS rules into manager container
+  shell: |
+    docker cp {{ role_path }}/files/local_rules_ddos.xml \
+      single-node-wazuh.manager-1:/var/ossec/etc/rules/local_rules_ddos.xml
+    docker exec single-node-wazuh.manager-1 \
+      chown wazuh:wazuh /var/ossec/etc/rules/local_rules_ddos.xml
+
+- name: Render Active Response injection script
+  template:
+    src: inject_active_response.py.j2
+    dest: /tmp/inject_active_response.py
+    mode: '0755'
+
+- name: Inject AR config into host-side wazuh_manager.conf (survives restart)
+  command: python3 /tmp/inject_active_response.py
+  register: inject_result
+  changed_when: "'OK' in inject_result.stdout"
+
+- name: Restart Wazuh manager to pick up new rules + AR config
+  command: docker restart single-node-wazuh.manager-1
+
+- name: Wait for Wazuh manager API to come back
+  uri:
+    url: "https://{{ wazuh_server_ip }}:55000/"
+    method: GET
+    validate_certs: false
+    status_code: [200, 401]
+  register: api_check
+  until: api_check.status in [200, 401]
+  retries: 30
+  delay: 10

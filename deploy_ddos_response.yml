@@ -1,0 +1,26 @@
+---
+# Deploys the DDoS auto-response scenario:
+#
+#   1. SOC manager  — adds custom nginx decoder + HTTP-flood rules + AR config
+#   2. Windows DMZ  — installs nginx reverse proxy (port 80 -> Juice Shop 3000),
+#                     wires Wazuh agent to monitor access.log,
+#                     deploys Active Response scripts (rate-limit + firewall block)
+#
+# Prerequisites: site.yml + deploy_windows_dmz.yml already done so that Wazuh
+# manager and Wazuh agent on the Windows host are running and registered.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini deploy_ddos_response.yml
+
+- name: Configure DDoS detection on Wazuh manager
+  hosts: soc
+  become: true
+  gather_facts: true
+  roles:
+    - wazuh_ddos_rules
+
+- name: Deploy nginx + Active Response on Windows DMZ
+  hosts: external
+  gather_facts: false
+  roles:
+    - nginx_dmz_windows

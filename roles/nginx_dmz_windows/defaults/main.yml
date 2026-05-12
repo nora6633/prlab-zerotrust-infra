@@ -1,0 +1,6 @@
+---
+nginx_version: "1.27.3"
+nginx_install_dir: 'C:\nginx'
+nginx_listen_port: 80
+juice_shop_upstream_port: 3000
+wazuh_agent_install_dir: 'C:\Program Files (x86)\ossec-agent'

@@ -1,0 +1,91 @@
+---
+- name: Ensure nginx install dir exists
+  ansible.windows.win_file:
+    path: "{{ nginx_install_dir }}"
+    state: directory
+
+- name: Download nginx for Windows
+  ansible.windows.win_get_url:
+    url: "https://nginx.org/download/nginx-{{ nginx_version }}.zip"
+    dest: 'C:\soc-infra\nginx-{{ nginx_version }}.zip'
+    force: false
+
+- name: Extract nginx
+  community.windows.win_unzip:
+    src: 'C:\soc-infra\nginx-{{ nginx_version }}.zip'
+    dest: 'C:\soc-infra'
+    creates: 'C:\soc-infra\nginx-{{ nginx_version }}\nginx.exe'
+
+- name: Move nginx files into install dir (idempotent)
+  ansible.windows.win_shell: |
+    $src  = 'C:\soc-infra\nginx-{{ nginx_version }}'
+    $dest = '{{ nginx_install_dir }}'
+    if (Test-Path "$src\nginx.exe") {
+      Copy-Item -Path "$src\*" -Destination $dest -Recurse -Force
+    }
+  args:
+    creates: '{{ nginx_install_dir }}\nginx.exe'
+
+- name: Template nginx.conf (reverse proxy + limit_req zone)
+  ansible.windows.win_template:
+    src: nginx.conf.j2
+    dest: '{{ nginx_install_dir }}\conf\nginx.conf'
+
+- name: Deploy empty limit-active.conf placeholder
+  ansible.windows.win_copy:
+    src: limit-active.conf
+    dest: '{{ nginx_install_dir }}\conf\limit-active.conf'
+    force: false
+
+- name: Register nginx as Windows service via NSSM
+  ansible.windows.win_shell: |
+    $status = nssm status nginx 2>&1
+    if ($status -notmatch 'SERVICE_') {
+      nssm install nginx '{{ nginx_install_dir }}\nginx.exe' '-p' '{{ nginx_install_dir }}'
+    }
+    nssm set nginx AppDirectory '{{ nginx_install_dir }}'
+    nssm set nginx DisplayName 'Nginx Reverse Proxy (Juice Shop)'
+    nssm set nginx Start SERVICE_AUTO_START
+    nssm start nginx 2>&1 | Out-Null
+    exit 0
+
+- name: Ensure nginx service is running
+  ansible.windows.win_service:
+    name: nginx
+    state: started
+    start_mode: auto
+
+- name: Allow inbound HTTP on {{ nginx_listen_port }}
+  community.windows.win_firewall_rule:
+    name: "Nginx HTTP"
+    localport: "{{ nginx_listen_port }}"
+    action: allow
+    direction: in
+    protocol: tcp
+    state: present
+    enabled: true
+
+- name: Add nginx access.log to Wazuh agent localfile config
+  community.windows.win_lineinfile:
+    path: '{{ wazuh_agent_install_dir }}\ossec.conf'
+    insertbefore: '</ossec_config>'
+    line: "  <localfile><log_format>syslog</log_format><location>{{ nginx_install_dir }}\\logs\\access.log</location></localfile>"
+    regexp: 'localfile.*nginx.*access\.log'
+    state: present
+  notify: restart wazuh agent
+
+- name: Ensure AR script directory exists on agent
+  ansible.windows.win_file:
+    path: '{{ wazuh_agent_install_dir }}\active-response\bin'
+    state: directory
+
+- name: Deploy Active Response scripts to Wazuh agent
+  ansible.windows.win_copy:
+    src: "active-response/{{ item }}"
+    dest: '{{ wazuh_agent_install_dir }}\active-response\bin\{{ item }}'
+  loop:
+    - firewall-block.cmd
+    - firewall-block.ps1
+    - nginx-ratelimit.cmd
+    - nginx-ratelimit.ps1
+  notify: restart wazuh agent

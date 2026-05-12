@@ -1,0 +1,8 @@
+<!-- Custom decoder for nginx combined_extended access log.
+     PCRE2 type required because regex uses \S / \w shorthand classes
+     which are not supported by OSSEC's default regex engine. -->
+<decoder name="prlab-nginx-access">
+  <prematch type="pcre2">^\d+\.\d+\.\d+\.\d+ - </prematch>
+  <regex type="pcre2">^(\S+) - \S+ \[\S+ \S+\] "(\w+) (\S+) HTTP/[\d.]+" (\d+) </regex>
+  <order>srcip,protocol,url,status</order>
+</decoder>

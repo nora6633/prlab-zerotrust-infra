@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Inject DDoS Active Response config into Wazuh manager ossec.conf (idempotent).
+Targets the host-side bind-mounted file — changes to the in-container ossec.conf
+are wiped on every container restart by the entrypoint."""
+import re
+import sys
+
+OSSEC_CONF = "{{ wazuh_manager_host_conf }}"
+START = "<!-- BEGIN: prlab-ddos-active-response -->"
+END   = "<!-- END: prlab-ddos-active-response -->"
+
+block = f"""
+{START}
+  <command>
+    <name>nginx-ratelimit</name>
+    <executable>nginx-ratelimit.cmd</executable>
+    <timeout_allowed>no</timeout_allowed>
+  </command>
+
+  <command>
+    <name>firewall-block</name>
+    <executable>firewall-block.cmd</executable>
+    <timeout_allowed>yes</timeout_allowed>
+  </command>
+
+  <active-response>
+    <command>nginx-ratelimit</command>
+    <location>local</location>
+    <rules_id>100210</rules_id>
+  </active-response>
+
+  <active-response>
+    <command>firewall-block</command>
+    <location>local</location>
+    <rules_id>100211</rules_id>
+    <timeout>600</timeout>
+  </active-response>
+{END}
+""".strip()
+
+with open(OSSEC_CONF, "r") as f:
+    content = f.read()
+
+# Remove any prior block(s) — handles duplicates from earlier buggy runs.
+content = re.sub(
+    re.escape(START) + r".*?" + re.escape(END) + r"\s*",
+    "",
+    content,
+    flags=re.DOTALL,
+)
+
+# Insert exactly once before the FIRST </ossec_config> (the main config block;
+# ossec.conf often has a second block dedicated to active-responses.log).
+content = content.replace("</ossec_config>", f"{block}\n</ossec_config>", 1)
+
+with open(OSSEC_CONF, "w") as f:
+    f.write(content)
+
+print("OK")

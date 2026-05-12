@@ -66,12 +66,15 @@ Wazuh Manager
 │   ├── dfir_iris/                       ← DFIR-IRIS case management
 │   ├── freeipa/                         ← FreeIPA identity server
 │   ├── nextcloud/                       ← Nextcloud + MariaDB
-│   └── mailcow/                         ← Mailcow mail server suite
+│   ├── mailcow/                         ← Mailcow mail server suite
+│   ├── nginx_dmz_windows/               ← nginx reverse proxy + AR scripts (Windows)
+│   └── wazuh_ddos_rules/                ← custom decoder/rules + AR config injection
 ├── windows-dmz/
 │   └── setup-dmz.ps1                    ← manual PowerShell fallback (no Ansible)
 ├── site.yml                             ← deploy all services (Linux external)
 ├── deploy_windows_dmz.yml               ← deploy external host as Windows DMZ
 ├── deploy_soc_remaining.yml             ← resume partial SOC deploy (Shuffle + IRIS)
+├── deploy_ddos_response.yml             ← DDoS scenario: nginx + AR (rate-limit + block)
 └── configure_integration.yml            ← wire Wazuh → Shuffle → IRIS
 ```
 
@@ -205,6 +208,44 @@ This playbook:
 - Injects the `<integration>` block into `ossec.conf`
 - Restarts the Wazuh manager
 
+### 5. (Optional) Deploy DDoS auto-response scenario
+
+Adds an nginx reverse proxy in front of Juice Shop on the Windows DMZ host and wires Wazuh + Active Response to react to HTTP floods:
+
+```bash
+ansible-playbook -i inventory/hosts.ini deploy_ddos_response.yml
+```
+
+What gets deployed:
+
+| Layer | What | Where |
+|---|---|---|
+| Ingress | nginx :80 → Juice Shop :3000 (NSSM service) | Windows DMZ |
+| Detection | nginx access.log → Wazuh agent → custom decoder + rules 100210/100211 | manager |
+| Response (level 8) | `nginx-ratelimit.ps1` writes `limit_req` snippet, reloads nginx | Windows DMZ |
+| Response (level 10) | `firewall-block.ps1` adds `New-NetFirewallRule` blocking source IP for 600s | Windows DMZ |
+
+Test it from any host with [`wrk`](https://github.com/wg/wrk) installed (`brew install wrk`):
+
+```bash
+# 100 conns × 4 threads × 30s — easily exceeds rule 100211's 100 req / 10 s
+wrk -t4 -c100 -d30s http://<WINDOWS_DMZ_IP>/
+```
+
+Watch the chain trigger:
+
+```bash
+# alerts on the manager
+docker exec single-node-wazuh.manager-1 tail -f /var/ossec/logs/alerts/alerts.log
+# AR script log on the agent
+# (PowerShell on the Windows DMZ host)
+Get-Content 'C:\Program Files (x86)\ossec-agent\active-response\active-responses.log' -Wait
+# firewall rules added by AR
+Get-NetFirewallRule -DisplayName "Wazuh-AR-Block-*"
+```
+
+Expected: rule 100210 fires first (rate limit on), then 100211 fires and the source IP is blocked at the Windows firewall for 10 minutes.
+
 ---
 
 ## Service Endpoints
@@ -214,7 +255,8 @@ This playbook:
 | Wazuh Dashboard | SOC | `https://<SOC_IP>` |
 | Shuffle | SOC | `http://<SOC_IP>:3001` |
 | DFIR-IRIS | SOC | `https://<SOC_IP>:4444` |
-| Juice Shop | External (Linux or Windows DMZ) | `http://<EXTERNAL_IP>:3000` |
+| Juice Shop (direct) | External (Linux or Windows DMZ) | `http://<EXTERNAL_IP>:3000` |
+| Juice Shop (via nginx, after DDoS scenario deploy) | Windows DMZ | `http://<WINDOWS_DMZ_IP>/` |
 | FreeIPA | LAN | `https://<LAN_IP>:8443` |
 | Nextcloud | LAN | `http://<LAN_IP>:8888` |
 | Mailcow | LAN | `https://<LAN_IP>` |
