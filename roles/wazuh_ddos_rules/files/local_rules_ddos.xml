@@ -1,13 +1,17 @@
 <!-- DDoS HTTP flood detection on nginx reverse proxy.
-     Two tiers: Level 8 triggers nginx rate limit; Level 10 triggers Windows Firewall block. -->
+     Chains off Wazuh's built-in web-accesslog decoder (rule 31108 catches
+     simple GET / HEAD requests at level 0, which doesn't count in frequency
+     aggregations on its own). Rule 100200 promotes each web access to level 1
+     so the frequency rules below can count them. -->
 <group name="nginx,prlab,web,">
 
-  <rule id="100200" level="0">
-    <decoded_as>prlab-nginx-access</decoded_as>
-    <description>Nginx: web access</description>
+  <rule id="100200" level="1">
+    <if_sid>31108</if_sid>
+    <description>Nginx: web access (counted for HTTP flood detection)</description>
+    <group>web,accesslog,</group>
   </rule>
 
-  <rule id="100210" level="8" frequency="50" timeframe="10">
+  <rule id="100210" level="8" frequency="20" timeframe="10">
     <if_matched_sid>100200</if_matched_sid>
     <same_source_ip />
     <description>Nginx: HTTP flood (warn) from $(srcip) - rate limit triggered</description>
@@ -17,7 +21,7 @@
     </mitre>
   </rule>
 
-  <rule id="100211" level="10" frequency="100" timeframe="10">
+  <rule id="100211" level="10" frequency="50" timeframe="10">
     <if_matched_sid>100200</if_matched_sid>
     <same_source_ip />
     <description>Nginx: HTTP flood (block) from $(srcip) - IP blocked</description>

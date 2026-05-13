@@ -1,10 +1,8 @@
 ---
-- name: Copy nginx decoder into manager container
+- name: Remove obsolete custom nginx decoder if previously deployed
   shell: |
-    docker cp {{ role_path }}/files/local_decoder_nginx.xml \
-      single-node-wazuh.manager-1:/var/ossec/etc/decoders/local_decoder_nginx.xml
     docker exec single-node-wazuh.manager-1 \
-      chown wazuh:wazuh /var/ossec/etc/decoders/local_decoder_nginx.xml
+      rm -f /var/ossec/etc/decoders/local_decoder_nginx.xml
 
 - name: Copy DDoS rules into manager container
   shell: |

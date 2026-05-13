@@ -210,7 +210,7 @@ This playbook:
 
 ### 5. (Optional) Deploy DDoS auto-response scenario
 
-Adds an nginx reverse proxy in front of Juice Shop on the Windows DMZ host and wires Wazuh + Active Response to react to HTTP floods:
+Adds an nginx reverse proxy in front of Juice Shop on the Windows DMZ host and wires Wazuh detection rules + Active Response scripts for HTTP floods:
 
 ```bash
 ansible-playbook -i inventory/hosts.ini deploy_ddos_response.yml
@@ -221,30 +221,59 @@ What gets deployed:
 | Layer | What | Where |
 |---|---|---|
 | Ingress | nginx :80 → Juice Shop :3000 (NSSM service) | Windows DMZ |
-| Detection | nginx access.log → Wazuh agent → custom decoder + rules 100210/100211 | manager |
-| Response (level 8) | `nginx-ratelimit.ps1` writes `limit_req` snippet, reloads nginx | Windows DMZ |
-| Response (level 10) | `firewall-block.ps1` adds `New-NetFirewallRule` blocking source IP for 600s | Windows DMZ |
+| Detection | nginx access.log → Wazuh agent → built-in `web-accesslog` decoder → custom rules 100200 → 100210/100211 | manager |
+| Response Level 8 (`nginx-ratelimit.ps1`) | Writes `limit_req` snippet to `limit-active.conf`, reloads nginx | Windows DMZ |
+| Response Level 10 (`firewall-block.ps1`) | Adds `New-NetFirewallRule` blocking source IP for 600s | Windows DMZ |
+
+The custom rules chain off Wazuh's built-in nginx decoder rather than reimplementing parsing:
+
+```
+31108 (built-in: ignored URLs, level 0)
+  → 100200 (level 1, promote so frequency counts)
+    → 100210 (level 8, freq 20/10s) — rate limit tier
+    → 100211 (level 10, freq 50/10s) — block tier
+```
 
 Test it from any host with [`wrk`](https://github.com/wg/wrk) installed (`brew install wrk`):
 
 ```bash
-# 100 conns × 4 threads × 30s — easily exceeds rule 100211's 100 req / 10 s
 wrk -t4 -c100 -d30s http://<WINDOWS_DMZ_IP>/
 ```
 
-Watch the chain trigger:
+Watch alerts firing:
 
 ```bash
-# alerts on the manager
-docker exec single-node-wazuh.manager-1 tail -f /var/ossec/logs/alerts/alerts.log
-# AR script log on the agent
-# (PowerShell on the Windows DMZ host)
-Get-Content 'C:\Program Files (x86)\ossec-agent\active-response\active-responses.log' -Wait
-# firewall rules added by AR
-Get-NetFirewallRule -DisplayName "Wazuh-AR-Block-*"
+docker exec single-node-wazuh.manager-1 tail -f /var/ossec/logs/alerts/alerts.log | grep -E "10021"
 ```
 
-Expected: rule 100210 fires first (rate limit on), then 100211 fires and the source IP is blocked at the Windows firewall for 10 minutes.
+Expected: rules 100210 and 100211 fire repeatedly with `srcip` populated.
+
+**Known issue — auto-trigger of Active Response**: As of Wazuh 4.9.2, alerts from chained frequency rules with custom AR commands (`<expect>srcip</expect>` + `<location>local</location>`) do not consistently dispatch through `wazuh-execd` to the agent. The detection side works perfectly (alerts visible in dashboard, IRIS cases auto-created via Shuffle), and the AR scripts work when invoked manually. Investigation continues.
+
+**Manual AR invocation (use this for the demo's response phase):**
+
+```powershell
+# On the Windows DMZ host, as Administrator:
+
+# Trigger rate-limit response manually
+$payload = '{"command":"add","parameters":{"alert":{"data":{"srcip":"<ATTACKER_IP>"}}}}'
+$payload | & "C:\Program Files (x86)\ossec-agent\active-response\bin\nginx-ratelimit.cmd"
+
+# Trigger firewall block manually
+$payload | & "C:\Program Files (x86)\ossec-agent\active-response\bin\firewall-block.cmd"
+
+# Verify
+Get-NetFirewallRule -DisplayName "Wazuh-AR-Block-*"
+Get-Content C:\nginx\conf\limit-active.conf
+```
+
+**Cleanup after demo** (removes firewall block + clears rate limit):
+
+```powershell
+Get-NetFirewallRule -DisplayName "Wazuh-AR-Block-*" | Remove-NetFirewallRule
+Set-Content C:\nginx\conf\limit-active.conf '# disabled'
+& C:\nginx\nginx.exe -p C:\nginx -s reload
+```
 
 ---
 

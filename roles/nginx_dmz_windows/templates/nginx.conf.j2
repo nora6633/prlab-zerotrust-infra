@@ -31,7 +31,8 @@ http {
 
         location / {
             # Toggled by Active Response (file is empty by default).
-            include  conf/limit-active.conf;
+            # Path is relative to <prefix>/conf/ so just the filename.
+            include  limit-active.conf;
 
             proxy_pass         http://juiceshop;
             proxy_http_version 1.1;

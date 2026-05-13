@@ -14,12 +14,14 @@ block = f"""
   <command>
     <name>nginx-ratelimit</name>
     <executable>nginx-ratelimit.cmd</executable>
+    <expect>srcip</expect>
     <timeout_allowed>no</timeout_allowed>
   </command>
 
   <command>
     <name>firewall-block</name>
     <executable>firewall-block.cmd</executable>
+    <expect>srcip</expect>
     <timeout_allowed>yes</timeout_allowed>
   </command>
 
