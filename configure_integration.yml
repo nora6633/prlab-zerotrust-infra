@@ -32,7 +32,7 @@
         dest: "{{ deploy_base_dir }}/shuffle/wazuh_iris_workflow.json"
         mode: '0644'
 
-    - name: Import workflow into Shuffle via API
+    - name: Import IRIS workflow into Shuffle via API
       uri:
         url: "http://{{ wazuh_server_ip }}:5001/api/v1/workflows"
         method: POST
@@ -42,8 +42,31 @@
           Authorization: "Bearer {{ shuffle_default_apikey }}"
         validate_certs: false
         status_code: [200, 201]
-      register: workflow_import
-      failed_when: workflow_import.status not in [200, 201]
+      register: iris_workflow_import
+      failed_when: iris_workflow_import.status not in [200, 201]
+
+    - name: Load Python scorer source for DDoS workflow N5
+      set_fact:
+        score_alert_code: "{{ lookup('file', 'roles/shuffle/files/ddos_score_alert.py') }}"
+
+    - name: Template DDoS workflow JSON onto host (with embedded Python scorer)
+      template:
+        src: roles/shuffle/templates/wazuh_ddos_workflow.json.j2
+        dest: "{{ deploy_base_dir }}/shuffle/wazuh_ddos_workflow.json"
+        mode: '0644'
+
+    - name: Import DDoS workflow into Shuffle via API
+      uri:
+        url: "http://{{ wazuh_server_ip }}:5001/api/v1/workflows"
+        method: POST
+        body_format: json
+        body: "{{ lookup('template', 'roles/shuffle/templates/wazuh_ddos_workflow.json.j2') | from_json }}"
+        headers:
+          Authorization: "Bearer {{ shuffle_default_apikey }}"
+        validate_certs: false
+        status_code: [200, 201]
+      register: ddos_workflow_import
+      failed_when: ddos_workflow_import.status not in [200, 201]
 
     # ── Wazuh: install custom integration ────────────────────────────────
     - name: Template custom-shuffle integration script

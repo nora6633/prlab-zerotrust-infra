@@ -62,7 +62,7 @@ Wazuh Manager
 │   ├── wazuh_server/                    ← Wazuh single-node + integration setup
 │   ├── wazuh_agent/                     ← Wazuh agent container
 │   ├── juice_shop/                      ← OWASP Juice Shop
-│   ├── shuffle/                         ← Shuffle SOAR + workflow template
+│   ├── shuffle/                         ← Shuffle SOAR + workflow templates (IRIS + DDoS)
 │   ├── dfir_iris/                       ← DFIR-IRIS case management
 │   ├── freeipa/                         ← FreeIPA identity server
 │   ├── nextcloud/                       ← Nextcloud + MariaDB
@@ -274,6 +274,70 @@ Get-NetFirewallRule -DisplayName "Wazuh-AR-Block-*" | Remove-NetFirewallRule
 Set-Content C:\nginx\conf\limit-active.conf '# disabled'
 & C:\nginx\nginx.exe -p C:\nginx -s reload
 ```
+
+### 6. (Optional) DDoS SOAR workflow — 8-node Shuffle pipeline
+
+Sits on top of the Wazuh detection from §5 and adds an enrichment-then-decide pipeline:
+
+```
+N1 webhook (Wazuh alert)
+   └─[N2: rule.level >= 10]──┬─→ N3 AbuseIPDB lookup     ─┐
+                              └─→ N4 Wazuh history (24h)  ─┴─→ N5 Python scoring
+                                                                     │
+                                              ┌──────────────────────┼──────────────────────┐
+                                              ▼                      ▼                      ▼
+                                  N7a AUTO_BLOCK (>=70)   N7b NOTIFY_SOC (40–69)   N7c LOG_ONLY (<40)
+                                  (PA addr → rule → commit) (IRIS alert)            (skip)
+                                              └──────────────────────┼──────────────────────┘
+                                                                     ▼
+                                                          N8 IRIS case + MTTR
+```
+
+**N5 scoring (5 dimensions)** in `roles/shuffle/files/ddos_score_alert.py`:
+
+| Dimension | Trigger | Points |
+|---|---|---|
+| D1 Rule level | `level >= 12` / `>= 10` | +40 / +25 |
+| D2 Rule groups | `ddos` + `high_severity` / `ddos` alone | +30 / +15 |
+| D3 History (24h same srcip) | `>= 20` / `>= 5` alerts | +20 / +10 |
+| D4 AbuseIPDB confidence | `>= 50` | +10 |
+| D5 Off-hours | hour < 8 or >= 18 | +10 |
+
+**Pre-flight — set these in `group_vars/soc.yml` before importing:**
+
+| Variable | Where to get |
+|---|---|
+| `abuseipdb_api_key` | https://www.abuseipdb.com/account/api (free tier OK) |
+| `pa_firewall_ip` / `pa_api_key` | PAN-OS web UI → Generate API Key |
+| `wazuh_indexer_user` / `wazuh_indexer_password` | Wazuh single-node compose defaults are `admin` / `SecretPassword` |
+| `iris_adm_api_key` | DFIR-IRIS web UI → My Settings → API Key |
+| `soc_notify_email` | SOC alias |
+
+**Deploy** (re-runs `configure_integration.yml` which now imports BOTH the IRIS workflow and this DDoS workflow):
+
+```bash
+ansible-playbook -i inventory/hosts.ini configure_integration.yml
+```
+
+**Routing Wazuh → this workflow**: the existing `<integration>` block in `ossec.conf` POSTs alerts to the IRIS workflow's webhook. For DDoS alerts to reach the new workflow you have two options:
+
+- **(A)** Point the existing integration at the new DDoS webhook trigger ID instead (`shuffle_ddos_webhook_trigger_id` in `soc.yml`) — IRIS keeps getting cases via N8 of the DDoS workflow itself
+- **(B)** Add a second `<integration>` block (modify `inject_integration.py.j2` to also emit one) that POSTs to the DDoS webhook with a higher `<level>` threshold
+
+Option A is the cleanest if you only need one decision pipeline.
+
+**Test the workflow without firing real Wazuh alerts**:
+
+```bash
+# POST a synthetic alert directly to the DDoS webhook
+curl -X POST http://<SOC_IP>:5001/api/v1/hooks/<shuffle_ddos_webhook_trigger_id> \
+  -H "Content-Type: application/json" \
+  -d '{"id":"test-001","timestamp":"2026-05-19T22:00:00.000+0000","rule":{"id":"100211","level":12,"description":"HTTP flood","groups":["ddos","high_severity"]},"agent":{"id":"002","name":"dmz-windows"},"data":{"srcip":"203.0.113.5"}}'
+```
+
+Watch in Shuffle UI → Workflows → "Wazuh DDoS Auto-Response" → Runs. Each node lights up with its input/output.
+
+**Known limitation**: this workflow assumes a PAN-OS firewall reachable at `pa_firewall_ip` with REST API enabled. For lab environments without a real PA, the AUTO_BLOCK branch will fail at N7a; the LOG_ONLY and NOTIFY_SOC branches still work.
 
 ---
 

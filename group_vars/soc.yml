@@ -4,9 +4,31 @@ shuffle_admin_username: admin
 shuffle_admin_password: "ShuffleAdm1n!"
 # API key used by Ansible and Wazuh integration to authenticate with Shuffle
 shuffle_default_apikey: "CHANGE_ME_shuffle_api_key_min_36_chars!!"
-# Stable IDs for the pre-built workflow (must be valid UUIDs)
+# Stable IDs for the pre-built IRIS workflow
 shuffle_workflow_id: "b2c3d4e5-f6a7-8901-bcde-f01234567891"
 shuffle_webhook_trigger_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+# Stable IDs for the DDoS auto-response workflow
+shuffle_ddos_workflow_id: "c3d4e5f6-a7b8-9012-cdef-012345678912"
+shuffle_ddos_webhook_trigger_id: "b2c3d4e5-f6a7-8901-bcde-f01234567892"
+
+# ── PAN-OS firewall (used by DDoS workflow N7a AUTO_BLOCK path) ───────────
+# Set these before running the DDoS workflow's AUTO_BLOCK action.
+pa_firewall_ip: "CHANGE_ME_PA_FW_IP"
+pa_api_key: "CHANGE_ME_PA_API_KEY"
+pa_vsys: "vsys1"
+pa_dmz_zone: "dmz"
+
+# ── AbuseIPDB (N3) ────────────────────────────────────────────────────────
+# Get a free key at https://www.abuseipdb.com/account/api
+abuseipdb_api_key: "CHANGE_ME_ABUSEIPDB_API_KEY"
+
+# ── Wazuh indexer (N4 history query) ──────────────────────────────────────
+wazuh_indexer_url: "https://{{ wazuh_server_ip }}:9200"
+wazuh_indexer_user: "admin"
+wazuh_indexer_password: "SecretPassword"
+
+# ── SOC notification (N7b NOTIFY_SOC email) ───────────────────────────────
+soc_notify_email: "soc@example.lab"
 
 # ── DFIR-IRIS ──────────────────────────────────────────────────────────────
 iris_version: "v2.4.18"
