@@ -23,6 +23,7 @@
     juice_shop_port: 3000
     juice_shop_version: "19.2.1"
     install_dir: 'C:\soc-infra'
+    nginx_dir: 'C:\tools\nginx-1.31.2'
 
   tasks:
     - name: Create soc-infra directory
@@ -65,11 +66,12 @@
         $nodePath = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
         if (-not $nodePath) { $nodePath = "C:\Program Files\nodejs\node.exe" }
         $appDir  = "{{ install_dir }}\juice-shop_{{ juice_shop_version }}"
-        $appPath = "$appDir\app.js"
         $status = nssm status JuiceShop 2>&1
         if ($status -notmatch "SERVICE_") {
-          nssm install JuiceShop "$nodePath" "$appPath"
+          nssm install JuiceShop "$nodePath" "build/app"
         }
+        nssm set JuiceShop Application "$nodePath"
+        nssm set JuiceShop AppParameters "build/app"
         nssm set JuiceShop AppDirectory "$appDir"
         nssm set JuiceShop AppEnvironmentExtra "NODE_ENV=unsafe PORT={{ juice_shop_port }}"
         nssm set JuiceShop DisplayName "OWASP Juice Shop"
@@ -114,6 +116,11 @@
         state: started
         start_mode: auto
 
+    - name: Configure WazuhSvc auto-restart on failure
+      ansible.windows.win_shell: >
+        sc.exe failure WazuhSvc reset= 86400
+        actions= restart/5000/restart/10000/restart/30000
+
     - name: Allow Juice Shop inbound (port 3000)
       community.windows.win_firewall_rule:
         name: "Juice Shop HTTP"
@@ -135,6 +142,75 @@
         state: present
         enabled: true
 
+    - name: Install nginx
+      chocolatey.chocolatey.win_chocolatey:
+        name: nginx
+        state: present
+
+    - name: Create nginx log directory
+      ansible.windows.win_file:
+        path: 'C:\nginx\logs'
+        state: directory
+
+    - name: Configure nginx as reverse proxy for Juice Shop
+      ansible.windows.win_copy:
+        dest: 'C:/tools/nginx-1.31.2/conf/nginx.conf'
+        content: |
+          worker_processes 1;
+          events { worker_connections 1024; }
+          http {
+            include       mime.types;
+            access_log    logs/access.log combined;
+            error_log     logs/error.log warn;
+            server {
+              listen 80;
+              location / {
+                proxy_pass http://127.0.0.1:{{ juice_shop_port }};
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              }
+            }
+          }
+
+    - name: Install nginx as Windows service via NSSM
+      ansible.windows.win_shell: |
+        $status = nssm status nginx 2>&1
+        if ($status -notmatch "SERVICE_") {
+          nssm install nginx '{{ nginx_dir }}\nginx.exe'
+          nssm set nginx AppDirectory '{{ nginx_dir }}'
+        }
+        nssm set nginx Start SERVICE_AUTO_START
+        sc.exe stop nginx 2>$null
+        Start-Sleep 1
+        sc.exe start nginx
+      ignore_errors: true
+
+    - name: Allow nginx inbound (port 80)
+      community.windows.win_firewall_rule:
+        name: "nginx HTTP"
+        localport: "80"
+        action: allow
+        direction: in
+        protocol: tcp
+        state: present
+        enabled: true
+
+    - name: Configure Wazuh agent to monitor nginx access log
+      ansible.windows.win_shell: |
+        $conf = 'C:\Program Files (x86)\ossec-agent\ossec.conf'
+        $content = Get-Content $conf -Raw
+        $block = "  <localfile>`n    <location>{{ nginx_dir }}\logs\access.log</location>`n    <log_format>apache</log_format>`n  </localfile>"
+        if ($content -notmatch 'nginx.*access.log') {
+          $content = $content -replace '</ossec_config>', "$block`n</ossec_config>"
+          Set-Content $conf $content
+          Restart-Service WazuhSvc
+          Write-Output 'ADDED'
+        } else {
+          Write-Output 'ALREADY_EXISTS'
+        }
+      register: wazuh_conf_result
+
     - name: Wait for Juice Shop port to be listening
       ansible.windows.win_wait_for:
         port: "{{ juice_shop_port }}"
@@ -152,6 +228,8 @@
           - "================================================"
           - " Windows DMZ Deployment Complete"
           - "================================================"
-          - " Juice Shop  -> http://{{ ansible_host }}:{{ juice_shop_port }}"
+          - " Juice Shop  -> http://{{ ansible_host }}:{{ juice_shop_port }} (direct)"
+          - " nginx       -> http://{{ ansible_host }}:80 (reverse proxy)"
           - " Wazuh Agent -> {{ wazuh_svc.state }} (manager: {{ wazuh_manager_ip }})"
+          - " nginx logs  -> Wazuh: {{ wazuh_conf_result.stdout | trim }}"
           - "================================================"

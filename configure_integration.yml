@@ -32,18 +32,16 @@
         dest: "{{ deploy_base_dir }}/shuffle/wazuh_iris_workflow.json"
         mode: '0644'
 
-    - name: Import IRIS workflow into Shuffle via API
-      uri:
-        url: "http://{{ wazuh_server_ip }}:5001/api/v1/workflows"
-        method: POST
-        body_format: json
-        body: "{{ lookup('template', 'roles/shuffle/templates/wazuh_iris_workflow.json.j2') | from_json }}"
-        headers:
-          Authorization: "Bearer {{ shuffle_default_apikey }}"
-        validate_certs: false
-        status_code: [200, 201]
+    - name: Import IRIS workflow into Shuffle via API (curl, avoids uri module bytes issue)
+      shell: |
+        curl -ks -o /tmp/iris_import.out -w "%{http_code}" -X POST \
+          "http://{{ wazuh_server_ip }}:5001/api/v1/workflows" \
+          -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
+          -H "Content-Type: application/json" \
+          --data @{{ deploy_base_dir }}/shuffle/wazuh_iris_workflow.json
       register: iris_workflow_import
-      failed_when: iris_workflow_import.status not in [200, 201]
+      changed_when: iris_workflow_import.stdout in ["200", "201"]
+      failed_when: iris_workflow_import.stdout not in ["200", "201"]
 
     - name: Load Python scorer source for DDoS workflow N5
       set_fact:
@@ -55,32 +53,71 @@
         dest: "{{ deploy_base_dir }}/shuffle/wazuh_ddos_workflow.json"
         mode: '0644'
 
-    - name: Import DDoS workflow into Shuffle via API
-      uri:
-        url: "http://{{ wazuh_server_ip }}:5001/api/v1/workflows"
-        method: POST
-        body_format: json
-        body: "{{ lookup('template', 'roles/shuffle/templates/wazuh_ddos_workflow.json.j2') | from_json }}"
-        headers:
-          Authorization: "Bearer {{ shuffle_default_apikey }}"
-        validate_certs: false
-        status_code: [200, 201]
+    - name: Import DDoS workflow into Shuffle via API (curl)
+      shell: |
+        curl -ks -o /tmp/ddos_import.out -w "%{http_code}" -X POST \
+          "http://{{ wazuh_server_ip }}:5001/api/v1/workflows" \
+          -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
+          -H "Content-Type: application/json" \
+          --data @{{ deploy_base_dir }}/shuffle/wazuh_ddos_workflow.json
       register: ddos_workflow_import
-      failed_when: ddos_workflow_import.status not in [200, 201]
+      changed_when: ddos_workflow_import.stdout in ["200", "201"]
+      failed_when: ddos_workflow_import.stdout not in ["200", "201"]
+
+    - name: Show DDoS import response
+      shell: cat /tmp/ddos_import.out
+      register: ddos_import_resp
+      changed_when: false
+
+    - debug:
+        msg: "{{ ddos_import_resp.stdout | truncate(200) }}"
 
     # ── Wazuh: install custom integration ────────────────────────────────
-    - name: Template custom-shuffle integration script
+    # ── Capture Shuffle-assigned trigger IDs (Shuffle re-generates UUIDs on import) ──
+    - name: Query Shuffle for actual webhook trigger IDs
+      shell: |
+        curl -ks -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
+          "http://{{ wazuh_server_ip }}:5001/api/v1/workflows"
+      register: shuffle_workflows_raw
+      changed_when: false
+
+    - name: Parse trigger IDs from Shuffle workflows
+      set_fact:
+        shuffle_iris_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Alert to DFIR-IRIS Case') | first).triggers[0].id }}"
+        shuffle_ddos_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | first).triggers[0].id }}"
+
+    - name: Show captured trigger IDs
+      debug:
+        msg:
+          - "IRIS webhook trigger: {{ shuffle_iris_actual_trig }}"
+          - "DDoS webhook trigger: {{ shuffle_ddos_actual_trig }}"
+
+    - name: Activate both webhook hooks (idempotent)
+      shell: |
+        curl -ks -X POST -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
+          -H "Content-Type: application/json" \
+          -d '{"id":"{{ item.trig }}","name":"{{ item.name }}","info":{"name":"{{ item.name }}"},"type":"webhook","workflows":["{{ item.wf }}"],"status":"running","workflow":"{{ item.wf }}"}' \
+          "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/new"
+      loop:
+        - { trig: "{{ shuffle_iris_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Alert to DFIR-IRIS Case') | first).id }}", name: "Wazuh Webhook" }
+        - { trig: "{{ shuffle_ddos_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | first).id }}", name: "DDoS Webhook" }
+      changed_when: false
+
+    - name: Template custom-shuffle integration script (with actual trigger IDs)
       template:
         src: roles/wazuh_server/templates/custom-shuffle.py.j2
         dest: /tmp/custom-shuffle
         mode: '0755'
+      vars:
+        shuffle_webhook_trigger_id: "{{ shuffle_iris_actual_trig }}"
+        shuffle_ddos_webhook_trigger_id: "{{ shuffle_ddos_actual_trig }}"
 
-    - name: Copy integration script into wazuh.manager container
-      command: docker cp /tmp/custom-shuffle wazuh.manager:/var/ossec/integrations/custom-shuffle
+    - name: Copy integration script into single-node-wazuh.manager-1 container
+      command: docker cp /tmp/custom-shuffle single-node-wazuh.manager-1:/var/ossec/integrations/custom-shuffle
 
     - name: Set ownership and permissions on integration script
       command: >
-        docker exec wazuh.manager sh -c
+        docker exec single-node-wazuh.manager-1 sh -c
         "chown root:wazuh /var/ossec/integrations/custom-shuffle &&
          chmod 750 /var/ossec/integrations/custom-shuffle"
 
@@ -98,8 +135,8 @@
       debug:
         msg: "{{ inject_result.stdout }}"
 
-    - name: Restart wazuh.manager to apply integration config
-      command: docker restart wazuh.manager
+    - name: Restart single-node-wazuh.manager-1 to apply integration config
+      command: docker restart single-node-wazuh.manager-1
 
     # ── Summary ───────────────────────────────────────────────────────────
     - name: Print integration summary

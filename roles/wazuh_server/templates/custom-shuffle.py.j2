@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 """
-Wazuh custom integration: forward alerts to Shuffle SOAR webhook.
-Placed at /var/ossec/integrations/custom-shuffle on the wazuh.manager container.
+Wazuh custom integration: forward alerts to Shuffle SOAR webhook(s).
+
+Placed at /var/ossec/integrations/custom-shuffle in the manager container.
+Wazuh's integratord invokes it as:
+    custom-shuffle <alert_file> <api_key> <hook_url>
+We ignore positional args and use the URLs baked in at deploy time.
+
+Posts EVERY alert (level >= integration <level>) to:
+  1. The IRIS-case workflow (legacy) — keeps existing case automation working
+  2. The DDoS auto-response workflow — N2 inside that workflow filters
+     level >= 10 so SOC-only alerts are ignored cheaply
+
+Failure on one webhook does not block the other.
 """
 import json
 import sys
 import urllib.request
 import urllib.error
 
-SHUFFLE_WEBHOOK_URL = (
-    "http://{{ wazuh_server_ip }}:5001"
-    "/api/v1/hooks/{{ shuffle_webhook_trigger_id }}"
-)
+WEBHOOK_URLS = [
+    "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_webhook_trigger_id }}",
+    "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_ddos_webhook_trigger_id }}",
+]
 SHUFFLE_API_KEY = "{{ shuffle_default_apikey }}"
 
 
-def main():
-    alert_file_path = sys.argv[1]
-    with open(alert_file_path) as f:
-        alert = json.load(f)
-
-    payload = json.dumps(alert).encode("utf-8")
+def post(url, payload):
     req = urllib.request.Request(
-        SHUFFLE_WEBHOOK_URL,
+        url,
         data=payload,
         headers={
             "Content-Type": "application/json",
@@ -33,8 +39,17 @@ def main():
     try:
         urllib.request.urlopen(req, timeout=10)
     except urllib.error.URLError as e:
-        sys.stderr.write(f"Shuffle integration error: {e}\n")
-        sys.exit(1)
+        sys.stderr.write(f"custom-shuffle: {url} -> {e}\n")
+
+
+def main():
+    alert_file_path = sys.argv[1]
+    with open(alert_file_path) as f:
+        alert = json.load(f)
+
+    payload = json.dumps(alert).encode("utf-8")
+    for url in WEBHOOK_URLS:
+        post(url, payload)
 
 
 if __name__ == "__main__":

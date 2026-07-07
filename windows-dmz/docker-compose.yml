@@ -1,0 +1,22 @@
+services:
+  windows:
+    image: dockurr/windows
+    container_name: windows
+    environment:
+      VERSION: "11"
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - 8006:8006
+      - 3389:3389/tcp
+      - 3389:3389/udp
+      - 5985:5985/tcp
+      - 3000:3000/tcp
+      - 80:80/tcp
+    volumes:
+      - ./windows:/storage
+    restart: always
+    stop_grace_period: 2m

@@ -1,0 +1,17 @@
+services:
+  ubuntu:
+    image: ubuntu:24.04
+    container_name: lan
+    restart: unless-stopped
+    command: >
+      bash -c "apt update &&
+               apt install -y openssh-server &&
+               mkdir -p /var/run/sshd &&
+               id dev || useradd -m -s /bin/bash dev &&
+               echo 'dev:devpass' | chpasswd &&
+               exec /usr/sbin/sshd -D"
+    volumes:
+      - ./lan-workspace:/workspace
+    working_dir: /workspace
+    environment:
+      - TZ=Asia/Taipei

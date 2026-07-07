@@ -1,0 +1,13 @@
+# Windows VM runtime state — large binaries / machine-specific
+windows-dmz/windows/
+
+# Ubuntu LAN container workspace — runtime data
+ubuntu-lan/lan-workspace/
+
+# Ansible artifacts
+*.retry
+__pycache__/
+*.pyc
+
+# Claude Code local settings
+.claude/settings.local.json

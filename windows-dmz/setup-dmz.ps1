@@ -134,7 +134,16 @@ netsh advfirewall firewall add rule name="Wazuh Agent Out" dir=out action=allow 
 netsh advfirewall firewall add rule name="Juice Shop In" dir=in action=allow protocol=TCP localport=3000 2>&1 | Out-Null
 Write-OK "Firewall rules added."
 
-# ── 8. Summary ───────────────────────────────────────────────
+# ── 8. Enable WinRM for Ansible ─────────────────────────────
+Write-Step "Enabling WinRM..."
+winrm quickconfig -q
+winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+winrm set winrm/config/service/auth '@{Basic="true"}'
+Set-Service -Name WinRM -StartupType Automatic
+netsh advfirewall firewall add rule name="WinRM HTTP" dir=in action=allow protocol=TCP localport=5985 2>&1 | Out-Null
+Write-OK "WinRM enabled on port 5985."
+
+# ── 9. Summary ───────────────────────────────────────────────
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Green
 Write-Host "  DMZ Windows Setup Complete" -ForegroundColor Green
