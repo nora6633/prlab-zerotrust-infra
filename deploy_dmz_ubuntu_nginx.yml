@@ -1,0 +1,87 @@
+---
+# Installs nginx as a reverse proxy in front of Juice Shop on dmz-ubuntu,
+# and wires its access log into the Wazuh agent — the Linux equivalent of
+# the nginx_dmz_windows role. Run AFTER site.yml has deployed Docker,
+# the Wazuh agent, and Juice Shop to dmz-ubuntu.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini deploy_dmz_ubuntu_nginx.yml
+
+- name: Configure nginx reverse proxy + Wazuh log forwarding on dmz-ubuntu
+  hosts: dmz-ubuntu
+  become: true
+  gather_facts: true
+
+  vars:
+    juice_shop_port: 3000
+
+  tasks:
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: true
+
+    - name: Template nginx reverse-proxy config
+      copy:
+        dest: /etc/nginx/sites-available/juice-shop
+        content: |
+          server {
+            listen 80;
+            access_log /var/log/nginx/access.log combined;
+            location / {
+              proxy_pass http://127.0.0.1:{{ juice_shop_port }};
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+          }
+        mode: '0644'
+      notify: reload nginx
+
+    - name: Enable juice-shop site, disable default
+      file:
+        src: /etc/nginx/sites-available/juice-shop
+        dest: /etc/nginx/sites-enabled/juice-shop
+        state: link
+      notify: reload nginx
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: reload nginx
+
+    - name: Enable and start nginx
+      systemd:
+        name: nginx
+        enabled: true
+        state: started
+
+    - name: Configure Wazuh agent to monitor nginx access log
+      blockinfile:
+        path: /var/ossec/etc/ossec.conf
+        insertbefore: '</ossec_config>'
+        marker: "  <!-- {mark}: nginx access log -->"
+        block: |
+              <localfile>
+                <log_format>apache</log_format>
+                <location>/var/log/nginx/access.log</location>
+              </localfile>
+      notify: restart wazuh-agent
+
+    - name: Wait for Juice Shop port to be listening
+      wait_for:
+        port: "{{ juice_shop_port }}"
+        timeout: 60
+
+  handlers:
+    - name: reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
+
+    - name: restart wazuh-agent
+      systemd:
+        name: wazuh-agent
+        state: restarted

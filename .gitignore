@@ -3,6 +3,10 @@ windows-dmz/windows/
 
 # Ubuntu LAN container workspace — runtime data
 ubuntu-lan/lan-workspace/
+ubuntu-lan/authorized_keys
+
+# dmz-ubuntu container — SSH pubkey is machine-specific
+dmz-ubuntu/authorized_keys
 
 # Ansible artifacts
 *.retry

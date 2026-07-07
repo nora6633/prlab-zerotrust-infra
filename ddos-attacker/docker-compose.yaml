@@ -1,0 +1,18 @@
+services:
+  attacker:
+    image: ubuntu:24.04
+    container_name: ddos-attacker
+    command: >
+      bash -c "apt update &&
+               apt install -y curl apache2-utils &&
+               sleep infinity"
+    networks:
+      - windows-dmz_default
+      - dmz-ubuntu_default
+    restart: unless-stopped
+
+networks:
+  windows-dmz_default:
+    external: true
+  dmz-ubuntu_default:
+    external: true

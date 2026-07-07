@@ -18,16 +18,12 @@ services:
       - IPA_SERVER_INSTALL_OPTS=-U -r {{ freeipa_realm }} --setup-dns --no-forwarders --admin-password={{ freeipa_admin_password }} --ds-password={{ freeipa_ds_password }}
     volumes:
       - freeipa-data:/data
-      - /sys/fs/cgroup:/sys/fs/cgroup:ro
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=0
     tmpfs:
       - /run
       - /tmp
-    cap_add:
-      - SYS_TIME
-      - NET_ADMIN
-      - DAC_OVERRIDE
+    privileged: true
 
 volumes:
   freeipa-data:

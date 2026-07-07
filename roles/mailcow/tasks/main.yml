@@ -43,6 +43,30 @@
     cmd: docker compose pull
     chdir: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized"
 
+- name: Create Mailcow ssl asset directory
+  file:
+    path: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized/data/assets/ssl"
+    state: directory
+    mode: '0755'
+
+# With SKIP_LETS_ENCRYPT=y, the acme-mailcow container never generates a
+# certificate (it just sleeps forever) — nginx-mailcow then crash-loops on
+# a missing /etc/ssl/mail/cert.pem. Provide a self-signed one so it can start.
+- name: Generate self-signed cert for Mailcow nginx (SKIP_LETS_ENCRYPT=y has no fallback)
+  command:
+    cmd: >
+      openssl req -x509 -nodes -newkey rsa:4096 -keyout key.pem -out cert.pem -days 3650
+      -subj "/CN=mail.{{ domain }}" -addext "subjectAltName=DNS:mail.{{ domain }}"
+    chdir: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized/data/assets/ssl"
+    creates: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized/data/assets/ssl/cert.pem"
+
+- name: Create cert chain file for Mailcow nginx
+  copy:
+    src: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized/data/assets/ssl/cert.pem"
+    dest: "{{ deploy_base_dir }}/mailcow/mailcow-dockerized/data/assets/ssl/cert.chain.pem"
+    remote_src: true
+    mode: '0644'
+
 - name: Deploy Mailcow stack
   command:
     cmd: docker compose up -d

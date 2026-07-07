@@ -1,0 +1,16 @@
+services:
+  ubuntu:
+    build: .
+    image: dmz-ubuntu:systemd
+    container_name: dmz-ubuntu
+    restart: unless-stopped
+    privileged: true
+    stop_signal: SIGRTMIN+3
+    tmpfs:
+      - /run
+      - /run/lock
+    ports:
+      - "3010:3000"
+      - "81:80"
+    environment:
+      - TZ=Asia/Taipei

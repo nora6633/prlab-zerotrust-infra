@@ -55,11 +55,28 @@
     state: present
     update_cache: true
 
+- name: Use vfs storage driver for nested Docker (host runs inside a privileged container, not real hardware/VM)
+  copy:
+    content: |
+      {
+        "storage-driver": "vfs"
+      }
+    dest: /etc/docker/daemon.json
+    mode: '0644'
+  when: (ansible_connection | default('ssh')) not in ['winrm', 'local']
+  register: docker_daemon_json
+
 - name: Enable and start Docker service
   systemd:
     name: docker
     enabled: true
     state: started
+
+- name: Restart Docker to apply vfs storage driver
+  systemd:
+    name: docker
+    state: restarted
+  when: docker_daemon_json.changed | default(false)
 
 - name: Add ansible user to docker group
   user:

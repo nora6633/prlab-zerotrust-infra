@@ -1,15 +1,14 @@
 services:
   ubuntu:
-    image: ubuntu:24.04
+    build: .
+    image: ubuntu-lan:systemd
     container_name: lan
     restart: unless-stopped
-    command: >
-      bash -c "apt update &&
-               apt install -y openssh-server &&
-               mkdir -p /var/run/sshd &&
-               id dev || useradd -m -s /bin/bash dev &&
-               echo 'dev:devpass' | chpasswd &&
-               exec /usr/sbin/sshd -D"
+    privileged: true
+    stop_signal: SIGRTMIN+3
+    tmpfs:
+      - /run
+      - /run/lock
     volumes:
       - ./lan-workspace:/workspace
     working_dir: /workspace
