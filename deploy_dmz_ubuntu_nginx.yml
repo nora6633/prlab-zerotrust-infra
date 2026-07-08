@@ -75,6 +75,28 @@
         port: "{{ juice_shop_port }}"
         timeout: 60
 
+    - name: Install iptables (used by the ip-limit Active Response script)
+      apt:
+        name: iptables
+        state: present
+
+    - name: Ensure Wazuh agent Active Response bin directory exists
+      file:
+        path: /var/ossec/active-response/bin
+        state: directory
+        owner: root
+        group: wazuh
+        mode: '0750'
+
+    - name: Deploy ip-limit Active Response script (Shuffle-triggered only, see ddos-plan.txt Part 3)
+      copy:
+        src: roles/wazuh_ddos_rules/files/active-response/ip-limit.sh
+        dest: /var/ossec/active-response/bin/ip-limit.sh
+        owner: root
+        group: wazuh
+        mode: '0750'
+      notify: restart wazuh-agent
+
   handlers:
     - name: reload nginx
       systemd:

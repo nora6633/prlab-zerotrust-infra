@@ -7,10 +7,13 @@ Wazuh's integratord invokes it as:
     custom-shuffle <alert_file> <api_key> <hook_url>
 We ignore positional args and use the URLs baked in at deploy time.
 
-Posts EVERY alert (level >= integration <level>) to:
-  1. The IRIS-case workflow (legacy) — keeps existing case automation working
-  2. The DDoS auto-response workflow — N2 inside that workflow filters
-     level >= 10 so SOC-only alerts are ignored cheaply
+Posts to two webhooks with different filters:
+  1. IRIS-case workflow (legacy) — every alert (level >= integration <level>)
+     keeps existing case automation working for all of SOC, not just DDoS.
+  2. DDoS auto-response workflow — ONLY rule IDs 100210/100212/100213
+     (ddos-plan.txt Part 2: forward from the "watch" tier upward, never the
+     per-request base tag 100200/100211 — that fires once per HTTP request
+     and would flood Shuffle/AbuseIPDB with noise for zero decision value).
 
 Failure on one webhook does not block the other.
 """
@@ -19,11 +22,13 @@ import sys
 import urllib.request
 import urllib.error
 
-WEBHOOK_URLS = [
-    "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_webhook_trigger_id }}",
-    "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_ddos_webhook_trigger_id }}",
-]
+IRIS_WEBHOOK_URL = "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_webhook_trigger_id }}"
+DDOS_WEBHOOK_URL = "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_ddos_webhook_trigger_id }}"
 SHUFFLE_API_KEY = "{{ shuffle_default_apikey }}"
+
+# ddos-plan.txt Part 2: forward the escalation-worthy rules only, not the
+# per-request base tag (100200 web-access, 100211 http-408-tag).
+DDOS_FORWARD_RULE_IDS = {"100210", "100212", "100213"}
 
 
 def post(url, payload):
@@ -48,8 +53,11 @@ def main():
         alert = json.load(f)
 
     payload = json.dumps(alert).encode("utf-8")
-    for url in WEBHOOK_URLS:
-        post(url, payload)
+    post(IRIS_WEBHOOK_URL, payload)
+
+    rule_id = str(alert.get("rule", {}).get("id", ""))
+    if rule_id in DDOS_FORWARD_RULE_IDS:
+        post(DDOS_WEBHOOK_URL, payload)
 
 
 if __name__ == "__main__":

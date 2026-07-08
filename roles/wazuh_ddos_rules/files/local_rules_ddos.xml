@@ -1,34 +1,88 @@
-<!-- DDoS HTTP flood detection on nginx reverse proxy.
-     Chains off Wazuh's built-in web-accesslog decoder (rule 31108 catches
-     simple GET / HEAD requests at level 0, which doesn't count in frequency
-     aggregations on its own). Rule 100200 promotes each web access to level 1
-     so the frequency rules below can count them. -->
-<group name="nginx,prlab,web,">
+<!-- DDoS HTTP flood + Slowloris detection on the nginx reverse proxy in front of
+     Juice Shop. Rule chain design follows ddos-plan.txt Parts 1-2, adapted to
+     this lab's actual Wazuh 4.9.2 ruleset:
 
+       - The plan's example chains off built-in rule 31103. In THIS ruleset
+         31103 is "SQL injection attempt" (see 0245-web_rules.xml), not a
+         generic access-log tag. The rule that actually fires for a plain
+         GET/HEAD flood is 31108 "Ignored URLs (simple queries)" - verified
+         empirically with wrk (see git history) and kept here for that reason.
+       - The plan's Slowloris rule filters on a field named "http_status".
+         The web-accesslog decoder in this ruleset names that field "id"
+         (see <order>srcip, protocol, url, id</order> in
+         0375-web-accesslog_decoders.xml) - confirmed with wazuh-logtest.
+         31108 itself only matches 2xx/3xx (<id>^2|^3</id>), so the Slowloris
+         branch cannot hang off it; it chains off 31101 (built-in "Web server
+         400 error code") instead, which already narrows to 4xx.
+
+     Detection produces alerts only - no <active-response> is bound to any
+     rule here. Blocking happens exclusively via Shuffle calling Wazuh's
+     Active Response API after scoring (see inject_active_response.py.j2 and
+     roles/shuffle/files/ddos_score_alert.py) so a mis-scored legitimate user
+     is never blocked by reflex. -->
+<group name="ddos,web_attack,juiceshop,">
+
+  <!-- ============================================================
+       100200: base tagging rule - fires once PER request (2xx/3xx only)
+       Promotes 31108 (level 0, doesn't count towards frequency) to a
+       level so the frequency rules below can count it.
+       ============================================================ -->
   <rule id="100200" level="1">
     <if_sid>31108</if_sid>
     <description>Nginx: web access (counted for HTTP flood detection)</description>
     <group>web,accesslog,</group>
   </rule>
 
-  <rule id="100210" level="8" frequency="20" timeframe="10">
+  <!-- ============================================================
+       100210: traffic spike - 100 hits of 100200 from the SAME IP in 10s
+       "Watch" tier - this is the sid forwarded to Shuffle (ddos-plan.txt's
+       300011). Not bound to any active-response: Shuffle decides.
+       ============================================================ -->
+  <rule id="100210" level="8" frequency="100" timeframe="10">
     <if_matched_sid>100200</if_matched_sid>
     <same_source_ip />
-    <description>Nginx: HTTP flood (warn) from $(srcip) - rate limit triggered</description>
-    <group>http_flood,attack,</group>
-    <mitre>
-      <id>T1499.002</id>
-    </mitre>
+    <description>Nginx: HTTP rate spike from $(srcip): 100 reqs in 10s</description>
+    <mitre><id>T1499.002</id></mitre>
+    <group>ddos,http_flood,attack,</group>
   </rule>
 
-  <rule id="100211" level="10" frequency="50" timeframe="10">
-    <if_matched_sid>100200</if_matched_sid>
+  <!-- ============================================================
+       100211: base tag for HTTP 408 (client timeout) responses.
+       Independent of 100200 - Slowloris connections never complete a
+       request, so nginx logs them as 408, not 2xx/3xx. Chains off the
+       built-in 31101 (400-class errors) and narrows to 408 specifically.
+       ============================================================ -->
+  <rule id="100211" level="1">
+    <if_sid>31101</if_sid>
+    <id>^408$</id>
+    <description>Nginx: HTTP 408 (client timeout) - counted for Slowloris detection</description>
+    <group>web,accesslog,</group>
+  </rule>
+
+  <!-- ============================================================
+       100212: Slowloris - 50 HTTP 408s from the SAME IP in 30s
+       Independent branch (not part of the 100210->100213 chain).
+       Forwarded to Shuffle alongside 100210/100213.
+       ============================================================ -->
+  <rule id="100212" level="10" frequency="50" timeframe="30">
+    <if_matched_sid>100211</if_matched_sid>
     <same_source_ip />
-    <description>Nginx: HTTP flood (block) from $(srcip) - IP blocked</description>
-    <group>http_flood,attack,</group>
-    <mitre>
-      <id>T1499.002</id>
-    </mitre>
+    <description>Nginx: Slowloris attack from $(srcip): 50x HTTP 408 in 30s</description>
+    <mitre><id>T1499.002</id></mitre>
+    <group>ddos,slowloris,attack,</group>
+  </rule>
+
+  <!-- ============================================================
+       100213: confirmed DDoS - 50 hits of 100210 from the SAME IP in 30s
+       100210 already means "100 reqs/10s"; fifty of those windows in 30s
+       is ~5000 reqs/30s from one IP. Level 12 = confirmed, escalate.
+       ============================================================ -->
+  <rule id="100213" level="12" frequency="50" timeframe="30">
+    <if_matched_sid>100210</if_matched_sid>
+    <same_source_ip />
+    <description>Nginx: Confirmed DDoS from $(srcip) - SOAR escalation</description>
+    <mitre><id>T1499.002</id><id>T1498</id></mitre>
+    <group>ddos,http_flood,attack,high_severity,</group>
   </rule>
 
 </group>

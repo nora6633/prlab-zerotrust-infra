@@ -15,3 +15,6 @@ __pycache__/
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# ddos-attacker run_attack.sh state — tracks last-used source IP octet
+ddos-attacker/.last_ip_octet

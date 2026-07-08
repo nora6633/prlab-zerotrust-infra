@@ -210,134 +210,152 @@ This playbook:
 
 ### 5. (Optional) Deploy DDoS auto-response scenario
 
-Adds an nginx reverse proxy in front of Juice Shop on the Windows DMZ host and wires Wazuh detection rules + Active Response scripts for HTTP floods:
+Adds an nginx reverse proxy in front of Juice Shop on the DMZ host(s) and wires Wazuh detection rules + Active Response scripts for HTTP floods and Slowloris. Design follows `ddos-plan.txt`.
 
 ```bash
+# Windows DMZ + SOC-side rules/AR:
 ansible-playbook -i inventory/hosts.ini deploy_ddos_response.yml
+
+# Linux DMZ (dmz-ubuntu) nginx + AR script:
+ansible-playbook -i inventory/hosts.ini deploy_dmz_ubuntu_nginx.yml
 ```
 
 What gets deployed:
 
 | Layer | What | Where |
 |---|---|---|
-| Ingress | nginx :80 → Juice Shop :3000 (NSSM service) | Windows DMZ |
-| Detection | nginx access.log → Wazuh agent → built-in `web-accesslog` decoder → custom rules 100200 → 100210/100211 | manager |
-| Response Level 8 (`nginx-ratelimit.ps1`) | Writes `limit_req` snippet to `limit-active.conf`, reloads nginx | Windows DMZ |
-| Response Level 10 (`firewall-block.ps1`) | Adds `New-NetFirewallRule` blocking source IP for 600s | Windows DMZ |
+| Ingress | nginx :80 → Juice Shop :3000 | dmz-windows (NSSM) / dmz-ubuntu (systemd) |
+| Detection | nginx access.log → Wazuh agent → rules 100200/100211 → 100210/100212/100213 | manager |
+| Response | Wazuh Active Response `ip-limit-windows` / `ip-limit-linux` — netsh / iptables block on ports 80/443, 5-min auto-release. **Not bound to any rule** — dispatched only by the Shuffle workflow below (§6) after scoring | dmz-windows / dmz-ubuntu |
 
-The custom rules chain off Wazuh's built-in nginx decoder rather than reimplementing parsing:
+The rule chain (`roles/wazuh_ddos_rules/files/local_rules_ddos.xml`) mirrors `ddos-plan.txt`'s design, adapted to this ruleset's actual built-in rules (31108 fires for plain GET/HEAD floods here, not 31103 — verified with `wazuh-logtest`; the decoder names the status field `id`, not `http_status`):
 
 ```
-31108 (built-in: ignored URLs, level 0)
+31108 (built-in: ignored URLs 2xx/3xx, level 0)
   → 100200 (level 1, promote so frequency counts)
-    → 100210 (level 8, freq 20/10s) — rate limit tier
-    → 100211 (level 10, freq 50/10s) — block tier
+    → 100210 (level 8, freq 100/10s)   — "watch" tier, forwarded to Shuffle
+      → 100213 (level 12, freq 50/30s of 100210) — confirmed DDoS, escalate
+
+31101 (built-in: 400-class error) --id 408--> 100211 (level 1, promote)
+  → 100212 (level 10, freq 50/30s)    — Slowloris, forwarded to Shuffle
 ```
 
-Test it from any host with [`wrk`](https://github.com/wg/wrk) installed (`brew install wrk`):
+The `custom-shuffle` integration script (`roles/wazuh_server/templates/custom-shuffle.py.j2`) forwards **every** alert to the legacy IRIS webhook, but only rule IDs `100210`/`100212`/`100213` to the DDoS webhook — the per-request base tags (`100200`/`100211`) fire once per HTTP request and would flood Shuffle/AbuseIPDB for zero decision value.
+
+Test it with [`wrk`](https://github.com/wg/wrk) or `ab`:
 
 ```bash
-wrk -t4 -c100 -d30s http://<WINDOWS_DMZ_IP>/
+wrk -t4 -c100 -d30s http://<DMZ_IP>/
 ```
 
 Watch alerts firing:
 
 ```bash
-docker exec single-node-wazuh.manager-1 tail -f /var/ossec/logs/alerts/alerts.log | grep -E "10021"
+docker exec single-node-wazuh.manager-1 tail -f /var/ossec/logs/alerts/alerts.log | grep -E "1002(10|12|13)"
 ```
 
-Expected: rules 100210 and 100211 fire repeatedly with `srcip` populated.
+**Active Response is manual/API-dispatch only** (`ddos-plan.txt` Part 3: detection and enforcement are deliberately decoupled so Shuffle's scoring node — not a rule match — decides). Trigger it via the Wazuh API:
 
-**Known issue — auto-trigger of Active Response**: As of Wazuh 4.9.2, alerts from chained frequency rules with custom AR commands (`<expect>srcip</expect>` + `<location>local</location>`) do not consistently dispatch through `wazuh-execd` to the agent. The detection side works perfectly (alerts visible in dashboard, IRIS cases auto-created via Shuffle), and the AR scripts work when invoked manually. Investigation continues.
+```bash
+TOKEN=$(curl -sk -u wazuh-wui:'MyS3cr37P450r.*-' -X POST "https://<SOC_IP>:55000/security/user/authenticate?raw=true")
+curl -sk -X PUT "https://<SOC_IP>:55000/active-response?agents_list=<AGENT_ID>" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"command":"ip-limit-linux300","arguments":["<ATTACKER_IP>"],"alert":{"data":{"srcip":"<ATTACKER_IP>"}}}'
+# Use "ip-limit-windows300" for a Windows agent instead.
+```
 
-**Manual AR invocation (use this for the demo's response phase):**
+Or invoke the script directly on the agent (bypasses Wazuh entirely — useful to prove the script works in isolation):
 
+```bash
+# dmz-ubuntu:
+echo '{"command":"add","parameters":{"alert":{"data":{"srcip":"<ATTACKER_IP>"}}}}' | \
+  sudo /var/ossec/active-response/bin/ip-limit.sh
+```
 ```powershell
-# On the Windows DMZ host, as Administrator:
-
-# Trigger rate-limit response manually
-$payload = '{"command":"add","parameters":{"alert":{"data":{"srcip":"<ATTACKER_IP>"}}}}'
-$payload | & "C:\Program Files (x86)\ossec-agent\active-response\bin\nginx-ratelimit.cmd"
-
-# Trigger firewall block manually
-$payload | & "C:\Program Files (x86)\ossec-agent\active-response\bin\firewall-block.cmd"
-
-# Verify
-Get-NetFirewallRule -DisplayName "Wazuh-AR-Block-*"
-Get-Content C:\nginx\conf\limit-active.conf
+# dmz-windows, as Administrator:
+'{"command":"add","parameters":{"alert":{"data":{"srcip":"<ATTACKER_IP>"}}}}' | \
+  & "C:\Program Files (x86)\ossec-agent\active-response\bin\ip-limit.cmd"
 ```
 
-**Cleanup after demo** (removes firewall block + clears rate limit):
+**Resolved — AR dispatch reliability**: earlier revisions of this doc described this as flaky/unreliable on both platforms (manager always accepted the API call, but the agent inconsistently — sometimes never — actually ran the script). Root-caused during a live debug session: **it wasn't a manager→agent delivery problem at all**. `wazuh-execd`'s debug log showed it always received and started executing the AR command; the actual bug was in `ip-limit.sh`/`ip-limit.ps1` themselves — both read stdin to EOF (`INPUT_JSON=$(cat)` / `[Console]::In.ReadToEnd()`), but `wazuh-execd` does not reliably close its end of the stdin pipe after writing the payload. This is a confirmed, unresolved upstream Wazuh bug (Wazuh 4.8.0/4.9.0/4.9.2 — see [wazuh/wazuh#25784](https://github.com/wazuh/wazuh/issues/25784) "Active Response gets stuck after first execution" and [wazuh/wazuh#25915](https://github.com/wazuh/wazuh/discussions/25915)): the read-to-EOF call blocks forever, permanently wedging that child process (`ps` showed a stuck `cat`/`.NET ReadToEnd` holding a pipe whose write end `wazuh-execd` itself never closed), and once wedged, subsequent AR requests on that agent got stuck behind it too — exactly matching the "works once, then stuck until restart" pattern observed throughout testing.
 
+**Fix**: both scripts now read exactly one line (`IFS= read -r INPUT_JSON` / `[Console]::In.ReadLine()`) instead of reading to EOF, matching Wazuh's own documented AR stdin protocol ("read up to the newline character"). Verified live after the fix: 5 rapid back-to-back AR calls to dmz-ubuntu and 4 to dmz-windows all executed correctly with no hangs (previously ~50% failure rate on Linux, 0% success across every attempt on Windows). If you're running an older checkout, redeploy via `deploy_dmz_ubuntu_nginx.yml` / `deploy_ddos_response.yml` to pick up the fixed scripts.
+
+**Cleanup after demo:**
+
+```bash
+# dmz-ubuntu
+sudo iptables -D INPUT -s <ATTACKER_IP> -p tcp -m multiport --dports 80,443 -j DROP
+```
 ```powershell
-Get-NetFirewallRule -DisplayName "Wazuh-AR-Block-*" | Remove-NetFirewallRule
-Set-Content C:\nginx\conf\limit-active.conf '# disabled'
-& C:\nginx\nginx.exe -p C:\nginx -s reload
+# dmz-windows
+Get-NetFirewallRule -DisplayName "Wazuh-AR-IPLimit-*" | Remove-NetFirewallRule
 ```
 
-### 6. (Optional) DDoS SOAR workflow — 8-node Shuffle pipeline
+### 6. (Optional) DDoS SOAR workflow — cache-dedupe → enrich → score → decide
 
-Sits on top of the Wazuh detection from §5 and adds an enrichment-then-decide pipeline:
+Sits on top of the Wazuh detection from §5. Design follows `ddos-plan.txt` Part 4-5, adapted to real Shuffle app semantics (verified live against the running Shuffle backend — see below) and swapping the plan's PAN-OS firewall for a direct call to the Wazuh Active Response API, since this lab has no PA appliance:
 
 ```
-N1 webhook (Wazuh alert)
-   └─[N2: rule.level >= 10]──┬─→ N3 AbuseIPDB lookup     ─┐
-                              └─→ N4 Wazuh history (24h)  ─┴─→ N5 Python scoring
-                                                                     │
-                                              ┌──────────────────────┼──────────────────────┐
-                                              ▼                      ▼                      ▼
-                                  N7a AUTO_BLOCK (>=70)   N7b NOTIFY_SOC (40–69)   N7c LOG_ONLY (<40)
-                                  (PA addr → rule → commit) (IRIS alert)            (skip)
-                                              └──────────────────────┼──────────────────────┘
-                                                                     ▼
-                                                          N8 IRIS case + MTTR
+webhook (rule 100210/100212/100213 only — filtered upstream by custom-shuffle)
+   │
+   ▼
+dedupe_check (get_cache_value "blocked:$srcip")
+   │
+   └─[found == false]──┬─→ abuseipdb_query ─┐
+                        └─→ wazuh_history ───┴─→ score_alert (Python, pure)
+                                                        │
+                        ┌───────────────────────────────┼───────────────────────────────┐
+                        ▼                                ▼                                ▼
+            AUTO_BLOCK (score>=70,               NOTIFY_SOC (40-69, or            LOG_ONLY (score<40)
+             no degraded evidence)                degraded-evidence downgrade)
+            wazuh_auth → wazuh_ar_block_{windows,linux}  notify_soc (IRIS alert)    iris_log_alert
+              (branch on $exec.agent.name)               │                         (plain alert,
+              → set_dedupe_cache                         │                          no case)
+                        └────────────┬─────────────────┘
+                                     ▼
+                              iris_record_case (IRIS case)
 ```
 
-**N5 scoring (5 dimensions)** in `roles/shuffle/files/ddos_score_alert.py`:
+**Scoring (3 dimensions)** in `roles/shuffle/files/ddos_score_alert.py` — exactly `ddos-plan.txt` Part 4's design:
 
-| Dimension | Trigger | Points |
+| Dimension | Trigger | Points (cap) |
 |---|---|---|
-| D1 Rule level | `level >= 12` / `>= 10` | +40 / +25 |
-| D2 Rule groups | `ddos` + `high_severity` / `ddos` alone | +30 / +15 |
-| D3 History (24h same srcip) | `>= 20` / `>= 5` alerts | +20 / +10 |
-| D4 AbuseIPDB confidence | `>= 50` | +10 |
-| D5 Off-hours | hour < 8 or >= 18 | +10 |
+| Rule level | `level >= 12` / `>= 10` | +40 / +25 (cap 40) |
+| 24h history (same srcip, Wazuh indexer) | `>= 20` / `>= 5` alerts | +30 / +20 (cap 30) |
+| AbuseIPDB confidence | `>= 80` / `>= 50` | +70 / +40 (cap 70) |
+
+Decision bands: `>=70` AUTO_BLOCK, `40-69` NOTIFY_SOC, `<40` LOG_ONLY. A degraded dimension (AbuseIPDB/indexer query returned non-200, tracked via each HTTP node's real `.status`, not just a body-parse failure) is recorded in `degraded[]`; if that would have produced AUTO_BLOCK, the safety valve downgrades it to NOTIFY_SOC instead, so a human sees the evidence gap rather than the machine silently blocking on incomplete information.
+
+**Cache dedupe** (`dedupe_check`/`set_dedupe_cache` nodes, per `ddos-plan.txt`'s closing mitigation): during a real flood the same attacker fires 100210 repeatedly, so re-querying AbuseIPDB and re-issuing AR blocks for an IP that's already blocked wastes API quota and produces duplicate cases. Verified live against Shuffle Tools' `get_cache_value`: a missing key returns `{"found": false, ...}` (not an error), and `set_cache_value` under the same key afterward flips it to `{"found": true, "value": "blocked", ...}` — the branch condition checks `$dedupe_check.found` for exactly this.
+
+**Shuffle variable-substitution quirk (why some fields are hardcoded/rerouted)**: found and worked around during this build, verified with throwaway probe workflows against the live Shuffle backend. Dot-path field extraction from an `execute_python` node's JSON stdout (e.g. `$score_alert.srcip`) into a *downstream* node's URL/body reliably resolves to an empty string — confirmed with `execution_delay` set on the consumer, so it isn't a timing race. Separately, `$exec.agent.name`/`$exec.agent.id` (from the webhook trigger payload, not a Python node) resolves fine on unconditional edges but unreliably on a node that is the *direct destination of a conditional branch* — sometimes returns the whole parent object instead of the leaf, non-deterministically. Branch *conditions* themselves (`$score_alert` / `$dedupe_check.found`, evaluated as whole-value "contains" checks rather than field extraction) were reliable in every test. Net effect on this workflow: `notify_soc`/`iris_log_alert` don't reference `agent.name` in their body text, and `wazuh_ar_block_windows`/`wazuh_ar_block_linux` get their target agent ID from `dmz_windows_agent_id`/`dmz_ubuntu_agent_id` (rendered by Ansible at import time) instead of `$exec.agent.id` — the field that decides which agent gets blocked shouldn't depend on an unreliable substitution.
 
 **Pre-flight — set these in `group_vars/soc.yml` before importing:**
 
 | Variable | Where to get |
 |---|---|
 | `abuseipdb_api_key` | https://www.abuseipdb.com/account/api (free tier OK) |
-| `pa_firewall_ip` / `pa_api_key` | PAN-OS web UI → Generate API Key |
+| `wazuh_api_user` / `wazuh_api_password` | Same credential the Wazuh dashboard uses (`wazuh.yml.j2`); default is `wazuh-wui` / the value baked into that template |
 | `wazuh_indexer_user` / `wazuh_indexer_password` | Wazuh single-node compose defaults are `admin` / `SecretPassword` |
 | `iris_adm_api_key` | DFIR-IRIS web UI → My Settings → API Key |
-| `soc_notify_email` | SOC alias |
+| `dmz_windows_agent_id` / `dmz_ubuntu_agent_id` | `docker exec single-node-wazuh.manager-1 /var/ossec/bin/agent_control -l` — hardcoded into the AUTO_BLOCK nodes at template time rather than read from the alert at runtime (see note below) |
 
-**Deploy** (re-runs `configure_integration.yml` which now imports BOTH the IRIS workflow and this DDoS workflow):
+**Deploy** (re-runs `configure_integration.yml` which imports BOTH the IRIS workflow and this DDoS workflow, and re-templates `custom-shuffle` with the live trigger IDs):
 
 ```bash
 ansible-playbook -i inventory/hosts.ini configure_integration.yml
 ```
 
-**Routing Wazuh → this workflow**: the existing `<integration>` block in `ossec.conf` POSTs alerts to the IRIS workflow's webhook. For DDoS alerts to reach the new workflow you have two options:
-
-- **(A)** Point the existing integration at the new DDoS webhook trigger ID instead (`shuffle_ddos_webhook_trigger_id` in `soc.yml`) — IRIS keeps getting cases via N8 of the DDoS workflow itself
-- **(B)** Add a second `<integration>` block (modify `inject_integration.py.j2` to also emit one) that POSTs to the DDoS webhook with a higher `<level>` threshold
-
-Option A is the cleanest if you only need one decision pipeline.
-
 **Test the workflow without firing real Wazuh alerts**:
 
 ```bash
-# POST a synthetic alert directly to the DDoS webhook
-curl -X POST http://<SOC_IP>:5001/api/v1/hooks/<shuffle_ddos_webhook_trigger_id> \
+curl -X POST http://<SOC_IP>:5001/api/v1/hooks/webhook_<shuffle_ddos_webhook_trigger_id> \
   -H "Content-Type: application/json" \
-  -d '{"id":"test-001","timestamp":"2026-05-19T22:00:00.000+0000","rule":{"id":"100211","level":12,"description":"HTTP flood","groups":["ddos","high_severity"]},"agent":{"id":"002","name":"dmz-windows"},"data":{"srcip":"203.0.113.5"}}'
+  -d '{"id":"test-001","timestamp":"2026-05-19T22:00:00.000+0000","rule":{"id":"100213","level":12,"description":"Confirmed DDoS"},"agent":{"id":"007","name":"dmz-ubuntu"},"data":{"srcip":"203.0.113.5"}}'
 ```
 
-Watch in Shuffle UI → Workflows → "Wazuh DDoS Auto-Response" → Runs. Each node lights up with its input/output.
-
-**Known limitation**: this workflow assumes a PAN-OS firewall reachable at `pa_firewall_ip` with REST API enabled. For lab environments without a real PA, the AUTO_BLOCK branch will fail at N7a; the LOG_ONLY and NOTIFY_SOC branches still work.
+Watch in Shuffle UI → Workflows → "Wazuh DDoS Auto-Response" → Runs, or poll `GET /api/v1/workflows/<id>/executions`. Each node's `result` field shows its input/output — useful for confirming the scoring decision and evidence without touching the UI.
 
 ---
 

@@ -1,11 +1,29 @@
 {
   "id": "{{ shuffle_ddos_workflow_id }}",
   "name": "Wazuh DDoS Auto-Response",
-  "description": "8-node SOAR workflow: filter L>=10 alerts, enrich with AbuseIPDB + Wazuh history, score (5 dimensions), then AUTO_BLOCK via PA / NOTIFY_SOC / LOG_ONLY based on confidence score. MTTR recorded to DFIR-IRIS.",
-  "tags": ["wazuh", "ddos", "pa", "soar", "abuseipdb"],
+  "description": "Cache-dedupe -> enrich (AbuseIPDB + Wazuh 24h history) -> score (3 dimensions, ddos-plan.txt Part 4) -> AUTO_BLOCK via Wazuh Active Response API / NOTIFY_SOC / LOG_ONLY. Case or plain alert recorded to DFIR-IRIS depending on the decision.",
+  "tags": ["wazuh", "ddos", "soar", "abuseipdb", "active-response"],
   "status": "running",
   "workflow_variables": [],
   "actions": [
+
+    {
+      "id": "dedupe_check",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "shuffle-tools",
+      "name": "get_cache_value",
+      "label": "dedupe_check",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "key",
+          "value": "blocked:$exec.data.srcip"
+        }
+      ],
+      "position": {"x": 300, "y": 250}
+    },
 
     {
       "id": "abuseipdb_query",
@@ -30,7 +48,7 @@
           "value": "true"
         }
       ],
-      "position": {"x": 300, "y": 150}
+      "position": {"x": 600, "y": 150}
     },
 
     {
@@ -60,7 +78,7 @@
           "value": "false"
         }
       ],
-      "position": {"x": 300, "y": 350}
+      "position": {"x": 600, "y": 350}
     },
 
     {
@@ -78,89 +96,115 @@
           "value": {{ score_alert_code | to_json }}
         }
       ],
-      "position": {"x": 600, "y": 250}
-    },
-
-    {
-      "id": "pa_create_address",
-      "app_name": "HTTP",
-      "app_version": "1.4.0",
-      "app_id": "http",
-      "name": "POST",
-      "label": "pa_create_address",
-      "environment": "Shuffle",
-      "is_valid": true,
-      "parameters": [
-        {
-          "name": "url",
-          "value": "https://{{ pa_firewall_ip }}/restapi/v10.2/Objects/Addresses?location=vsys&vsys={{ pa_vsys }}&name=SOAR_ADDR_$exec.id"
-        },
-        {
-          "name": "headers",
-          "value": "X-PAN-KEY: {{ pa_api_key }}\r\nContent-Type: application/json"
-        },
-        {
-          "name": "body",
-          "value": "{\"entry\":[{\"@name\":\"SOAR_ADDR_$exec.id\",\"ip-netmask\":\"$exec.data.srcip/32\",\"description\":\"Auto-blocked by Shuffle DDoS workflow from Wazuh rule $exec.rule.id\"}]}"
-        },
-        {
-          "name": "verify",
-          "value": "false"
-        }
-      ],
-      "position": {"x": 900, "y": 100}
-    },
-
-    {
-      "id": "pa_create_rule",
-      "app_name": "HTTP",
-      "app_version": "1.4.0",
-      "app_id": "http",
-      "name": "POST",
-      "label": "pa_create_rule",
-      "environment": "Shuffle",
-      "is_valid": true,
-      "parameters": [
-        {
-          "name": "url",
-          "value": "https://{{ pa_firewall_ip }}/restapi/v10.2/Policies/SecurityRules?location=vsys&vsys={{ pa_vsys }}&name=SOAR_BLOCK_$exec.id"
-        },
-        {
-          "name": "headers",
-          "value": "X-PAN-KEY: {{ pa_api_key }}\r\nContent-Type: application/json"
-        },
-        {
-          "name": "body",
-          "value": "{\"entry\":[{\"@name\":\"SOAR_BLOCK_$exec.id\",\"from\":{\"member\":[\"{{ pa_dmz_zone }}\"]},\"to\":{\"member\":[\"{{ pa_dmz_zone }}\"]},\"source\":{\"member\":[\"SOAR_ADDR_$exec.id\"]},\"destination\":{\"member\":[\"any\"]},\"service\":{\"member\":[\"any\"]},\"application\":{\"member\":[\"any\"]},\"action\":\"deny\",\"log-end\":\"yes\",\"description\":\"Auto-block from Wazuh rule $exec.rule.id level $exec.rule.level\"}]}"
-        },
-        {
-          "name": "verify",
-          "value": "false"
-        }
-      ],
       "position": {"x": 900, "y": 250}
     },
 
     {
-      "id": "pa_commit",
+      "id": "wazuh_auth",
       "app_name": "HTTP",
       "app_version": "1.4.0",
       "app_id": "http",
       "name": "POST",
-      "label": "pa_commit",
+      "label": "wazuh_auth",
       "environment": "Shuffle",
       "is_valid": true,
       "parameters": [
         {
           "name": "url",
-          "value": "https://{{ pa_firewall_ip }}/api/?type=commit&cmd=<commit></commit>&key={{ pa_api_key }}"
+          "value": "https://{{ wazuh_server_ip }}:55000/security/user/authenticate?raw=true"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Basic {{ (wazuh_api_user + ':' + wazuh_api_password) | b64encode }}"
         },
         {
           "name": "verify",
           "value": "false"
         }
       ],
-      "position": {"x": 900, "y": 400}
+      "position": {"x": 1200, "y": 100}
+    },
+
+    {
+      "id": "wazuh_ar_block_windows",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "PUT",
+      "label": "wazuh_ar_block_windows",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:55000/active-response?agents_list={{ dmz_windows_agent_id }}&pretty=true"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Bearer $wazuh_auth.body\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"command\":\"ip-limit-windows300\",\"arguments\":[\"$exec.data.srcip\"],\"alert\":{\"data\":{\"srcip\":\"$exec.data.srcip\"}}}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 1200, "y": 200}
+    },
+
+    {
+      "id": "wazuh_ar_block_linux",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "PUT",
+      "label": "wazuh_ar_block_linux",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:55000/active-response?agents_list={{ dmz_ubuntu_agent_id }}&pretty=true"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Bearer $wazuh_auth.body\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"command\":\"ip-limit-linux300\",\"arguments\":[\"$exec.data.srcip\"],\"alert\":{\"data\":{\"srcip\":\"$exec.data.srcip\"}}}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 1200, "y": 320}
+    },
+
+    {
+      "id": "set_dedupe_cache",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "shuffle-tools",
+      "name": "set_cache_value",
+      "label": "set_dedupe_cache",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "key",
+          "value": "blocked:$exec.data.srcip"
+        },
+        {
+          "name": "value",
+          "value": "blocked"
+        }
+      ],
+      "position": {"x": 1500, "y": 250}
     },
 
     {
@@ -183,23 +227,53 @@
         },
         {
           "name": "body",
-          "value": "{\"alert_title\":\"NOTIFY_SOC: DDoS from $exec.data.srcip\",\"alert_description\":\"Wazuh rule $exec.rule.id ($exec.rule.description) from agent $exec.agent.name. Manual triage required - see Shuffle execution for full evidence + score breakdown.\",\"alert_severity_id\":4,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$exec.timestamp\"}"
+          "value": "{\"alert_title\":\"NOTIFY_SOC: DDoS from $exec.data.srcip\",\"alert_description\":\"Wazuh rule $exec.rule.id ($exec.rule.description) Manual triage required - see Shuffle execution for full evidence + score breakdown.\",\"alert_severity_id\":4,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$exec.timestamp\"}"
         },
         {
           "name": "verify",
           "value": "false"
         }
       ],
-      "position": {"x": 900, "y": 600}
+      "position": {"x": 900, "y": 500}
     },
 
     {
-      "id": "iris_record_mttr",
+      "id": "iris_log_alert",
       "app_name": "HTTP",
       "app_version": "1.4.0",
       "app_id": "http",
       "name": "POST",
-      "label": "iris_record_mttr",
+      "label": "iris_log_alert",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:4444/alerts/add"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Bearer {{ iris_adm_api_key }}\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"alert_title\":\"LOG_ONLY: DDoS signal from $exec.data.srcip\",\"alert_description\":\"Wazuh rule $exec.rule.id ($exec.rule.description) Score below NOTIFY_SOC threshold - logged for visibility only, no action taken. See Shuffle execution for score breakdown.\",\"alert_severity_id\":1,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$exec.timestamp\"}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 900, "y": 700}
+    },
+
+    {
+      "id": "iris_record_case",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "POST",
+      "label": "iris_record_case",
       "environment": "Shuffle",
       "is_valid": true,
       "parameters": [
@@ -213,14 +287,14 @@
         },
         {
           "name": "body",
-          "value": "{\"case_name\":\"DDoS: $exec.rule.description from $exec.data.srcip\",\"case_description\":\"**Source IP**: $exec.data.srcip\\n**Wazuh rule**: $exec.rule.id (level $exec.rule.level)\\n**Description**: $exec.rule.description\\n**Agent**: $exec.agent.name\\n**Alert timestamp**: $exec.timestamp\\n\\nSee Shuffle execution for AbuseIPDB confidence + 5-dimension score + AUTO_BLOCK/NOTIFY/LOG_ONLY decision.\",\"case_soc_id\":\"W-$exec.id\",\"case_customer\":1,\"case_classification\":1}"
+          "value": "{\"case_name\":\"DDoS: $exec.rule.description from $exec.data.srcip\",\"case_description\":\"**Source IP**: $exec.data.srcip\\n**Wazuh rule**: $exec.rule.id (level $exec.rule.level)\\n**Description**: $exec.rule.description\\n**Agent**: $exec.agent.name\\n**Alert timestamp**: $exec.timestamp\\n\\nSee Shuffle execution for AbuseIPDB confidence + 3-dimension score + AUTO_BLOCK/NOTIFY decision.\",\"case_soc_id\":\"W-$exec.id\",\"case_customer\":1,\"case_classification\":1}"
         },
         {
           "name": "verify",
           "value": "false"
         }
       ],
-      "position": {"x": 1200, "y": 400}
+      "position": {"x": 1500, "y": 400}
     }
 
   ],
@@ -228,7 +302,7 @@
     {
       "app_name": "Shuffle Triggers",
       "name": "DDoS Webhook",
-      "description": "Receives Wazuh DDoS alerts (rule.id 100210/100211/100212)",
+      "description": "Receives Wazuh DDoS alerts (rule.id 100210/100212/100213 — filtered by custom-shuffle integration, see custom-shuffle.py.j2)",
       "id": "{{ shuffle_ddos_webhook_trigger_id }}",
       "type": "WEBHOOK",
       "status": "running",
@@ -236,7 +310,7 @@
       "parameters": [
         {
           "name": "info",
-          "value": "Receives Wazuh alerts via HTTP POST. Wazuh integration filters to level >= 10."
+          "value": "Receives Wazuh alerts via HTTP POST. Rule-ID filtering happens in custom-shuffle, not here."
         }
       ],
       "position": {"x": 50, "y": 250}
@@ -245,28 +319,35 @@
   "branches": [
 
     {
-      "id": "br-trigger-to-abuse",
+      "id": "br-trigger-to-dedupe",
       "source_id": "{{ shuffle_ddos_webhook_trigger_id }}",
+      "destination_id": "dedupe_check",
+      "label": ""
+    },
+
+    {
+      "id": "br-dedupe-to-abuse",
+      "source_id": "dedupe_check",
       "destination_id": "abuseipdb_query",
-      "label": "N2: rule.level >= 10",
+      "label": "not already blocked (ddos-plan.txt cache dedupe mitigation)",
       "conditions": [
         {
-          "source": {"name": "level_filter", "value": "$exec.rule.level"},
-          "destination": {"value": "10"},
-          "condition": {"value": "larger than or equal"}
+          "source": {"name": "found_filter", "value": "$dedupe_check.found"},
+          "destination": {"value": "false"},
+          "condition": {"value": "contains"}
         }
       ]
     },
     {
-      "id": "br-trigger-to-history",
-      "source_id": "{{ shuffle_ddos_webhook_trigger_id }}",
+      "id": "br-dedupe-to-history",
+      "source_id": "dedupe_check",
       "destination_id": "wazuh_history",
-      "label": "N2: rule.level >= 10 (parallel)",
+      "label": "not already blocked (parallel)",
       "conditions": [
         {
-          "source": {"name": "level_filter", "value": "$exec.rule.level"},
-          "destination": {"value": "10"},
-          "condition": {"value": "larger than or equal"}
+          "source": {"name": "found_filter", "value": "$dedupe_check.found"},
+          "destination": {"value": "false"},
+          "condition": {"value": "contains"}
         }
       ]
     },
@@ -285,10 +366,10 @@
     },
 
     {
-      "id": "br-score-to-pa-addr",
+      "id": "br-score-to-wazuh-auth",
       "source_id": "score_alert",
-      "destination_id": "pa_create_address",
-      "label": "AUTO_BLOCK (score >= 70)",
+      "destination_id": "wazuh_auth",
+      "label": "AUTO_BLOCK (score >= 70, no degraded evidence)",
       "conditions": [
         {
           "source": {"name": "action", "value": "$score_alert"},
@@ -298,21 +379,47 @@
       ]
     },
     {
-      "id": "br-pa-addr-to-pa-rule",
-      "source_id": "pa_create_address",
-      "destination_id": "pa_create_rule",
+      "id": "br-wazuh-auth-to-ar-windows",
+      "source_id": "wazuh_auth",
+      "destination_id": "wazuh_ar_block_windows",
+      "label": "agent is dmz-windows",
+      "conditions": [
+        {
+          "source": {"name": "agent_filter", "value": "$exec.agent.name"},
+          "destination": {"value": "windows"},
+          "condition": {"value": "contains"}
+        }
+      ]
+    },
+    {
+      "id": "br-wazuh-auth-to-ar-linux",
+      "source_id": "wazuh_auth",
+      "destination_id": "wazuh_ar_block_linux",
+      "label": "agent is dmz-ubuntu (or anything not Windows)",
+      "conditions": [
+        {
+          "source": {"name": "agent_filter", "value": "$exec.agent.name"},
+          "destination": {"value": "ubuntu"},
+          "condition": {"value": "contains"}
+        }
+      ]
+    },
+    {
+      "id": "br-ar-windows-to-cache",
+      "source_id": "wazuh_ar_block_windows",
+      "destination_id": "set_dedupe_cache",
       "label": ""
     },
     {
-      "id": "br-pa-rule-to-pa-commit",
-      "source_id": "pa_create_rule",
-      "destination_id": "pa_commit",
+      "id": "br-ar-linux-to-cache",
+      "source_id": "wazuh_ar_block_linux",
+      "destination_id": "set_dedupe_cache",
       "label": ""
     },
     {
-      "id": "br-pa-commit-to-iris",
-      "source_id": "pa_commit",
-      "destination_id": "iris_record_mttr",
+      "id": "br-cache-to-iris-case",
+      "source_id": "set_dedupe_cache",
+      "destination_id": "iris_record_case",
       "label": ""
     },
 
@@ -320,7 +427,7 @@
       "id": "br-score-to-notify",
       "source_id": "score_alert",
       "destination_id": "notify_soc",
-      "label": "NOTIFY_SOC (40 <= score < 70)",
+      "label": "NOTIFY_SOC (40-69, or degraded evidence downgrade from AUTO_BLOCK)",
       "conditions": [
         {
           "source": {"name": "action", "value": "$score_alert"},
@@ -330,17 +437,17 @@
       ]
     },
     {
-      "id": "br-notify-to-iris",
+      "id": "br-notify-to-iris-case",
       "source_id": "notify_soc",
-      "destination_id": "iris_record_mttr",
+      "destination_id": "iris_record_case",
       "label": ""
     },
 
     {
-      "id": "br-score-to-iris-log",
+      "id": "br-score-to-log",
       "source_id": "score_alert",
-      "destination_id": "iris_record_mttr",
-      "label": "LOG_ONLY (score < 40)",
+      "destination_id": "iris_log_alert",
+      "label": "LOG_ONLY (score < 40) - plain alert, no case",
       "conditions": [
         {
           "source": {"name": "action", "value": "$score_alert"},

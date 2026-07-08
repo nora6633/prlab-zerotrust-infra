@@ -1,0 +1,263 @@
+Here's a complete, working implementation of the DDoS scenario — the Wazuh side (rules + integration + Active Response) and the Shuffle side (the Python scoring node plus the enrichment glue). I'll build it in the order data actually flows, and explain the reasoning at each step. Where useful, I've hardened a few things beyond the report's version (notably the "degraded evidence" handling we discussed), and flagged those.
+Part 1 — Wazuh rules (/var/ossec/etc/rules/local_rules.xml)
+xml<group name="ddos,web_attack,juiceshop,">
+
+  <!-- ============================================================
+       300010: base tagging rule — fires once PER request
+       Reasoning: Wazuh's built-in 31103 recognizes a web access-log
+       line generically. We re-fire it as OUR rule so downstream
+       frequency rules have a single sid to count. Level should be 0
+       (silent) in production; we use 3 only so it's visible in the
+       alert panel during the experiment.
+       ============================================================ -->
+  <rule id="300010" level="3">
+    <if_sid>31103</if_sid>
+    <field name="url">^/rest/products/search</field>   <!-- scope to the attacked endpoint; optional -->
+    <same_source_ip />
+    <description>JuiceShop HTTP request from $(srcip)</description>
+    <mitre><id>T1499.002</id></mitre>
+    <group>ddos,web_attack,juiceshop,</group>
+  </rule>
+
+  <!-- ============================================================
+       300011: traffic spike — 100 hits of 300010 from the SAME IP in 10s
+       Reasoning: a DDoS is defined by AGGREGATION, not a single line.
+       frequency + timeframe + same_source_ip is Wazuh's stateful
+       counter — the one thing a rule engine does that a plain script
+       can't do cheaply. Level 8 = "watch", not yet "attack".
+       This is the sid we forward to Shuffle.
+       ============================================================ -->
+  <rule id="300011" level="8" frequency="100" timeframe="10">
+    <if_matched_sid>300010</if_matched_sid>
+    <same_source_ip />
+    <description>HTTP rate spike from $(srcip): 100 reqs in 10s</description>
+    <mitre><id>T1499.002</id></mitre>
+    <group>ddos,web_attack,juiceshop,</group>
+  </rule>
+
+  <!-- ============================================================
+       300012: Slowloris — 50 HTTP 408s from the SAME IP in 30s
+       Reasoning: Slowloris connections never COMPLETE a request, so
+       JuiceShop's own log shows nothing. Nginx times them out and
+       logs HTTP 408 — that 408 is the only observable artifact, and
+       this rule counts them. Independent branch (not part of the
+       300011->300013 chain).
+       ============================================================ -->
+  <rule id="300012" level="10" frequency="50" timeframe="30">
+    <if_matched_sid>300010</if_matched_sid>
+    <field name="http_status">^408$</field>
+    <same_source_ip />
+    <description>Slowloris attack from $(srcip): 50x HTTP 408 in 30s</description>
+    <mitre><id>T1499.002</id></mitre>
+    <group>ddos,slowloris,juiceshop,</group>
+  </rule>
+
+  <!-- ============================================================
+       300013: confirmed DDoS — 50 hits of 300011 from same IP in 30s
+       Reasoning: 300011 already means "100 reqs/10s". Fifty of THOSE
+       windows in 30s = ~5000 reqs/30s from one IP. That's no longer
+       ambiguous. Level 12 = confirmed; escalate to SOAR.
+       ============================================================ -->
+  <rule id="300013" level="12" frequency="50" timeframe="30">
+    <if_matched_sid>300011</if_matched_sid>
+    <same_source_ip />
+    <description>Confirmed DDoS from $(srcip): SOAR escalation</description>
+    <mitre><id>T1499.002</id><id>T1498</id></mitre>
+    <group>ddos,web_attack,juiceshop,high_severity,</group>
+  </rule>
+
+</group>
+Two things worth knowing before you deploy this:
+
+The rule IDs (300010–300013) are outside Wazuh's recommended custom range (100000–120000). They still work — Wazuh only hard-requires you don't collide with the built-in ruleset (0–99999) — but a stricter reviewer would renumber them into 100xxx. I kept the report's IDs for fidelity.
+Always validate before restarting. The feedback loop is much faster than replaying real traffic:
+
+bash# Feed a sample access-log line through the decoder + rule chain:
+sudo /var/ossec/bin/wazuh-logtest
+# paste a JuiceShop access.log line, confirm it matches 300010 first,
+# then check the chain fires under load. Only then:
+sudo systemctl restart wazuh-manager
+# Agents need NO change — rules are manager-side only.
+Part 2 — Forward the alert to Shuffle (/var/ossec/etc/ossec.conf)
+xml<integration>
+  <name>shuffle</name>
+  <hook_url>https://SHUFFLE_IP/api/v1/hooks/HOOK_ID</hook_url>
+  <rule_id>300011,300012,300013</rule_id>   <!-- forward the escalation-worthy rules -->
+  <alert_format>json</alert_format>
+</integration>
+Reasoning: we deliberately do not forward 300010 — that fires per-request and would flood Shuffle with noise. We forward from 300011 upward so Shuffle sees only "something worth deliberating about." We also intentionally don't bind <active-response> to the rule here — that would make blocking an unconditional reflex. Routing through Shuffle first is what inserts judgment between detection and enforcement.
+Part 3 — Active Response definitions (/var/ossec/etc/ossec.conf)
+This is the enforcement Wazuh performs after Shuffle decides. Shuffle calls it via the Wazuh API (Part 5).
+xml<command>
+  <name>ip-limit</name>
+  <executable>ip-limit.cmd</executable>
+  <timeout_allowed>no</timeout_allowed>
+</command>
+
+<active-response>
+  <disabled>no</disabled>
+  <command>ip-limit</command>
+  <location>defined-agent</location>
+  <agent_id>009</agent_id>          <!-- the JuiceShop host -->
+</active-response>
+The ip-limit.cmd → ip-limit.ps1 scripts live on the agent; the report already gives those (netsh firewall block on 80/443 with a 5-minute auto-release). The 5-minute auto-unblock is the key design choice: the block is a stopgap to buy the SOC time, not a verdict — a mis-scored legitimate user recovers on their own, and a human makes the permanent call.
+Part 4 — The Shuffle scoring node (the "shuffle script")
+This is the heart of what you asked for — the Python that runs in the N5 "Calculate Trust Score" Execute Python node. I've written it to be pure (no I/O, no side effects), because that's what makes it testable and replayable, and I've added the degraded-evidence handling we discussed (distinguishing "reputation = 0 clean" from "reputation lookup failed").
+In Shuffle, prior nodes' outputs reach this node via $node_name.field interpolation, which Shuffle substitutes as text before running the code. So the top of the script coerces those text inputs safely.
+pythonimport json
+
+# ---------------------------------------------------------------
+# INPUTS (Shuffle interpolates these as raw text before execution)
+#   $preprocess.*  comes from N2 (parsed alert)
+#   $abuseipdb.*   comes from N3 (AbuseIPDB HTTP node)
+#   $splunk.*      comes from N4 (Splunk query node)
+# We wrap every parse in a helper so a failed/empty upstream node
+# produces a KNOWN sentinel instead of crashing this node.
+# ---------------------------------------------------------------
+
+def as_int(raw, default=None):
+    """Coerce interpolated text -> int. Returns `default` (e.g. None)
+    when the upstream value is missing/empty/non-numeric, so we can
+    tell 'genuinely 0' apart from 'we never got a value'."""
+    try:
+        s = str(raw).strip()
+        return int(s) if s not in ("", "None", "null") else default
+    except (ValueError, TypeError):
+        return default
+
+rule_level  = as_int("$preprocess.rule_level", default=0)
+alerts_24h  = as_int("$splunk.result_count",   default=None)   # None => Splunk failed
+abuse_score = as_int("$abuseipdb.data.abuseConfidenceScore", default=None)  # None => AbuseIPDB failed
+
+score = 0
+evidence = []
+degraded = []   # records dimensions we couldn't evaluate
+
+# ---------------------------------------------------------------
+# DIMENSION 1 — Wazuh rule level (cap 40)
+# "How bad does the traffic pattern ITSELF look?"
+# Within a dimension we use elif (mutually exclusive buckets) so a
+# level-12 alert scores 40 ONCE, never 40+25.
+# The cap of 40 is deliberate: a textbook attack pattern from a
+# first-time, clean IP lands on EXACTLY 40 = NOTIFY_SOC, one point
+# short of auto-block. Policy: local pattern alone never auto-blocks;
+# first offense gets a human.
+# ---------------------------------------------------------------
+if rule_level >= 12:
+    score += 40
+    evidence.append(f"Rule level {rule_level} (Critical)")
+elif rule_level >= 10:
+    score += 25
+    evidence.append(f"Rule level {rule_level} (High)")
+else:
+    evidence.append(f"Rule level {rule_level} (Medium)")   # +0, still recorded
+
+# ---------------------------------------------------------------
+# DIMENSION 2 — 24h history from Splunk (cap 30)
+# "Is this IP a repeat offender against US?"
+# Cap 30 is BELOW the 40 notify threshold on purpose: persistence
+# ALONE can never escalate. A chatty-but-benign crawler racks up
+# history but must not get blocked on frequency without severity.
+# ---------------------------------------------------------------
+if alerts_24h is None:
+    degraded.append("history_unavailable")          # Splunk down -> flag it
+elif alerts_24h >= 20:
+    score += 30
+    evidence.append(f"Historical: {alerts_24h} alerts in 24h (persistent)")
+elif alerts_24h >= 5:
+    score += 20
+    evidence.append(f"Historical: {alerts_24h} alerts in 24h")
+
+# ---------------------------------------------------------------
+# DIMENSION 3 — AbuseIPDB reputation (cap 70)
+# "Is this IP known-bad to the WHOLE WORLD?"
+# This is the ONLY single dimension that can auto-block on its own
+# (>=80 -> +70). Reasoning: it's externally validated by hundreds of
+# independent reporters, so we trust it to act unilaterally, unlike
+# our own single-window observation.
+# NOTE: in a private-IP lab this always returns 0, so this path
+# never fires there — the Level12+history combo is what actually
+# reaches 70 in the experiment.
+# ---------------------------------------------------------------
+if abuse_score is None:
+    degraded.append("reputation_unavailable")       # AbuseIPDB down/ratelimited -> flag it
+elif abuse_score >= 80:
+    score += 70
+    evidence.append(f"AbuseIPDB score: {abuse_score} (known-bad)")
+elif abuse_score >= 50:
+    score += 40
+    evidence.append(f"AbuseIPDB score: {abuse_score} (suspicious)")
+
+# ---------------------------------------------------------------
+# DECISION BANDS
+#   >= 70  AUTO_BLOCK   (machine acts alone)
+#   40-69  NOTIFY_SOC   (human decides)
+#   < 40   LOG_ONLY     (just record)
+# ---------------------------------------------------------------
+if score >= 70:
+    action = "AUTO_BLOCK"
+elif score >= 40:
+    action = "NOTIFY_SOC"
+else:
+    action = "LOG_ONLY"
+
+# Safety valve BEYOND the report: never auto-block on a score that
+# was computed with a missing dimension — downgrade to human review.
+# Reasoning: a failed AbuseIPDB lookup silently drops a real attacker
+# from 70->40. If we're about to auto-block but evidence is degraded,
+# force NOTIFY_SOC so a human sees the gap.
+if action == "AUTO_BLOCK" and degraded:
+    action = "NOTIFY_SOC"
+    evidence.append(f"DEGRADED evidence, downgraded from AUTO_BLOCK: {','.join(degraded)}")
+
+# stdout IS the node's output in Shuffle — downstream nodes parse this JSON
+print(json.dumps({
+    "score": score,
+    "action": action,
+    "evidence": evidence,
+    "degraded": degraded,
+    "srcip": "$preprocess.srcip",
+}))
+Why this node is pure (no network calls, no blocking): N3 and N4 already did the I/O; N5 is deterministic arithmetic (level, history, reputation) → (score, action, evidence). That separation means (a) a Splunk hiccup and a scoring bug live in different failure surfaces, and (b) you can replay a year of historical alerts through this exact function offline to tune the 70/40 thresholds without re-hitting any API — which is precisely what you'd want before trusting those numbers in production. Same instinct as keeping fetchFromDB() out of calculateDiscount() in a Node service.
+Part 5 — The supporting nodes around N5
+The scoring node is useless without the nodes that feed it and act on it. Here's the minimal glue:
+N2 — Data pre-processing (Execute Python): pull the fields out of Wazuh's alert JSON so downstream nodes have clean inputs.
+pythonimport json
+alert = json.loads(r"""$exec""")     # $exec = the raw webhook body from N1
+data  = alert.get("data", {})
+print(json.dumps({
+    "srcip":      data.get("srcip", "0.0.0.0"),
+    "rule_level": alert.get("rule", {}).get("level", 0),
+    "rule_id":    alert.get("rule", {}).get("id", ""),
+    "agent_id":   alert.get("agent", {}).get("id", ""),
+}))
+N3 — AbuseIPDB (HTTP GET node): no code, just configure the node —
+GET https://api.abuseipdb.com/api/v2/check?ipAddress=$preprocess.srcip&maxAgeInDays=90, header Key: <api_key>, Accept: application/json. Its JSON response is what N5 reads as $abuseipdb.data.abuseConfidenceScore.
+N4 — Splunk (Splunk app node): run the SPL, return a count —
+search index="wazuh_logs" rule.id>300010 data.srcip="$preprocess.srcip" earliest=-24h | stats count as result_count
+N6 — Condition node: branch on $calc_score.action → AUTO_BLOCK / NOTIFY_SOC / LOG_ONLY.
+N7a — Wazuh AR call (HTTP PUT): this is where Shuffle commands Wazuh to enforce. The report shows it as an HTTP PUT to the Wazuh API:
+PUT https://WAZUH_MANAGER:55000/active-response
+Authorization: Bearer <token from a prior "get Wazuh token" node>
+Content-Type: application/json
+
+{
+  "command": "ip-limit",
+  "arguments": ["$preprocess.srcip"],
+  "custom": false,
+  "agents_list": ["009"]
+}
+N8 — IRIS (HTTP POST): record score + the evidence array as a case (AUTO_BLOCK/NOTIFY) or a plain alert (LOG_ONLY). This is the audit trail — when the machine blocks someone at 3 AM, this is how the analyst reconstructs why.
+N9 — Telegram/Email: notify SOC with the same evidence array.
+How the whole thing hangs together
+Nginx 408 + access logs ─▶ Wazuh Agent (009) ─▶ Wazuh Manager
+                                                   │  rules 300010→300011→300013 / 300012
+                                                   │  <integration> POST alert JSON
+                                                   ▼
+   N1 webhook ─▶ N2 parse ─┬─▶ N3 AbuseIPDB ─┐
+                           └─▶ N4 Splunk 24h ─┤
+                                              ▼
+                                    N5 score (pure)  ─▶ N6 branch ─┬─ AUTO_BLOCK ─▶ N7a Wazuh AR ─▶ N8 IRIS case ─▶ N9 notify
+                                                                   ├─ NOTIFY_SOC ─▶ N8 IRIS case ─▶ N9 notify
+                                                                   └─ LOG_ONLY   ─▶ N8 IRIS alert
+One deployment gotcha specific to this scenario: during a real flood, 300011 fires repeatedly, so Shuffle may receive many webhooks for the same attacker IP in seconds. Two mitigations you'll want: (1) the Nginx limit_req throttle keeps the server alive and caps how fast one IP can spam the log pipeline (fewer duplicate alerts); (2) add a Shuffle cache dedupe at the top of the workflow — Get Cache Value on key blocked:$preprocess.srcip, skip the workflow if it's already set, Set it after N7a. Otherwise you'll fire redundant AbuseIPDB lookups (burning your 1,000/day free-tier quota) and issue duplicate AR blocks for an IP that's already blocked.

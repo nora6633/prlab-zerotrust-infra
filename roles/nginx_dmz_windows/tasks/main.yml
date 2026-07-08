@@ -97,4 +97,6 @@
     - firewall-block.ps1
     - nginx-ratelimit.cmd
     - nginx-ratelimit.ps1
+    - ip-limit.cmd
+    - ip-limit.ps1
   notify: restart wazuh agent
