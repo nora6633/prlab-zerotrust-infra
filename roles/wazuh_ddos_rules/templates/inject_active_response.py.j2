@@ -13,7 +13,17 @@ documented in README.md for the old rule-bound bindings.
 Two commands (not one) because the executable Wazuh looks for lives on the
 AGENT's own disk and differs by OS — dmz-windows needs ip-limit.cmd (netsh),
 dmz-ubuntu needs ip-limit.sh (iptables). Shuffle picks the right command name
-per-alert based on agent name (see ddos_score_alert.py's ar_command field)."""
+per-alert based on agent name (see ddos_score_alert.py's ar_command field).
+
+ip-limit-windows has NO <timeout> (unlike ip-limit-linux): ip-limit.ps1
+self-manages its own 5-minute unblock (Start-Sleep 300 then netsh delete,
+inside the same invocation) rather than relying on Wazuh re-invoking it with
+"delete" later. Adding <timeout> here too would make Wazuh ALSO independently
+fire a delete 5 minutes after add, racing the script's own self-delete —
+harmless (netsh delete on an already-removed rule just no-ops) but redundant,
+and it changes the ar.conf-registered command name (built as <name><timeout>),
+which must stay in sync with what wazuh_ddos_workflow.json.j2's
+wazuh_ar_block_windows node calls."""
 import re
 import sys
 
@@ -27,7 +37,7 @@ block = f"""
     <name>ip-limit-windows</name>
     <executable>ip-limit.cmd</executable>
     <expect>srcip</expect>
-    <timeout_allowed>yes</timeout_allowed>
+    <timeout_allowed>no</timeout_allowed>
   </command>
 
   <command>
@@ -37,12 +47,13 @@ block = f"""
     <timeout_allowed>yes</timeout_allowed>
   </command>
 
-  <!-- No rules_id / level: manual/API dispatch only, never automatic. -->
+  <!-- No rules_id / level on either block: manual/API dispatch only, never
+       automatic. ip-limit-windows also has no <timeout> — see module
+       docstring; ip-limit.ps1 manages its own 5-min unblock. -->
   <active-response>
     <disabled>no</disabled>
     <command>ip-limit-windows</command>
     <location>all</location>
-    <timeout>300</timeout>
   </active-response>
 
   <active-response>

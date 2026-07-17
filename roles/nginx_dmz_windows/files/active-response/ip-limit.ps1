@@ -1,67 +1,72 @@
-# Wazuh Active Response — block a source IP on ports 80/443 only (Windows Firewall).
-# Manual/API-triggered only (ddos-plan.txt Part 3): this command has no <rules_id>
-# in ossec.conf, so it never fires automatically off an alert match — Shuffle
-# calls it via PUT /active-response after the N5 scoring node returns AUTO_BLOCK.
-# Wazuh re-invokes this script with "delete" after the AR <timeout> (5 min)
-# expires, so a mis-scored legitimate user recovers on their own.
-# Reads JSON from stdin per Wazuh AR protocol; supports add/delete commands.
+# Wazuh Active Response — block a source IP on ports 80/443 only, via netsh
+# advfirewall. Manual/API-triggered only (ddos-plan.txt Part 3): this command
+# has no <rules_id>/<level> in ossec.conf, so it never fires automatically off
+# an alert match — Shuffle calls it via PUT /active-response after the N5
+# scoring node returns AUTO_BLOCK.
 #
-# Reads exactly ONE line, not to EOF: wazuh-execd sends the payload as a
-# single newline-terminated line but does not reliably close its end of the
-# stdin pipe afterward (confirmed live on the Linux agent, matches known
-# unresolved upstream bugs — wazuh/wazuh#25784 "Active Response gets stuck
-# after first execution" and wazuh/wazuh#25915, which reports the identical
-# symptom on .NET's ReadToEnd()). [Console]::In.ReadToEnd() blocks forever
-# waiting for a stream close that never arrives. ReadLine() returns as soon
-# as it sees the newline, matching the documented AR stdin protocol exactly.
+# Self-contained 5-minute auto-release: this script blocks, sleeps 300s, then
+# unblocks itself in the SAME invocation, rather than relying on Wazuh's own
+# <timeout> to re-invoke it with "delete" later. Because of this, the
+# ip-limit-windows <active-response> block in ossec.conf must NOT also set
+# <timeout> (see inject_active_response.py.j2) — that would make Wazuh
+# independently re-invoke this script with "delete" 5 minutes after "add" too,
+# racing this script's own self-delete (harmless — `netsh ... delete rule` on
+# an already-removed rule just no-ops — but redundant, and it also changes the
+# ar.conf-registered command name that Shuffle has to call by exact string).
+#
+# Reads the AR payload from STDIN, not a script parameter: wazuh-execd pipes
+# the JSON to the process's stdin — confirmed live via /proc/<pid>/fd
+# inspection on the Linux agent (fd 0 is a pipe, not argv). Reads exactly one
+# line, not to EOF: wazuh-execd sends the payload as a single
+# newline-terminated line but does not reliably close its end of the stdin
+# pipe afterward (wazuh/wazuh#25784, #25915) — reading to EOF
+# ([Console]::In.ReadToEnd()) hangs forever waiting for a stream close that
+# never arrives; ReadLine() returns as soon as it sees the newline.
 
-$ErrorActionPreference = 'Stop'
-$logPath = 'C:\Program Files (x86)\ossec-agent\active-response\active-responses.log'
+$LogPath = "C:\Program Files (x86)\ossec-agent\active-response\bin\ip-limit.log"
 
-function Write-ARLog($msg) {
-    "$(Get-Date -Format 'yyyy/MM/dd HH:mm:ss') ip-limit: $msg" |
-        Out-File -FilePath $logPath -Append -Encoding ASCII
+function Write-Log ($Message) {
+    $CurrentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "[$CurrentTime] $Message" | Out-File -FilePath $LogPath -Append -Encoding utf8 | Out-Null
 }
 
 try {
-    $raw = [Console]::In.ReadLine()
-    if (-not $raw) { Write-ARLog 'no stdin'; exit 1 }
-
-    $payload = $raw | ConvertFrom-Json
-    $cmd     = $payload.command
-    $srcip   = $payload.parameters.alert.data.srcip
-    if (-not $srcip) { $srcip = $payload.parameters.alert.srcip }
-    if (-not $srcip) { Write-ARLog 'no srcip in alert'; exit 1 }
-
-    $ruleName = "Wazuh-AR-IPLimit-$srcip"
-
-    if ($cmd -eq 'add') {
-        if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule `
-                -DisplayName $ruleName `
-                -Description "Auto-blocked by Shuffle DDoS workflow (ip-limit)" `
-                -Direction Inbound `
-                -Action Block `
-                -Protocol TCP `
-                -LocalPort 80,443 `
-                -RemoteAddress $srcip | Out-Null
-            Write-ARLog "blocked $srcip on ports 80/443"
-        } else {
-            Write-ARLog "rule for $srcip already exists"
-        }
+    $RawArgs = [Console]::In.ReadLine()
+    if ([string]::IsNullOrEmpty($RawArgs)) {
+        Write-Log "[ERROR] No stdin payload received."
+        exit 0
     }
-    elseif ($cmd -eq 'delete') {
-        Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule
-        Write-ARLog "unblocked $srcip"
+    $Payload = $RawArgs.Trim('"')
+    if ([string]::IsNullOrWhiteSpace($Payload) -or $Payload -eq '""') {
+        Write-Log "[ERROR] Empty payload after trim."
+        exit 0
     }
-    else {
-        Write-ARLog "unknown command: $cmd"
-        exit 1
+
+    # Regex extraction of the target IP rather than JSON parsing: the AR body
+    # Shuffle sends is just {"command":"...","arguments":["<ip>"],
+    # "alert":{"data":{"srcip":"<ip>"}}} — the attacker IP is the only IPv4
+    # address present, so grabbing the first match is safe for this payload
+    # shape (if the payload ever grows to include other IP-bearing fields —
+    # e.g. agent.ip — this would need to become a real JSON parse instead).
+    $TargetIP = "Unknown"
+    $IPPattern = '\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
+    if ($Payload -match $IPPattern) {
+        $TargetIP = $Matches[0]
+    } else {
+        Write-Log "[ERROR] Valid IP not found."
+        exit 0
     }
-    exit 0
-}
-catch {
-    Write-ARLog "error: $_"
-    exit 1
+
+    $RuleName = "Wazuh-DDoS-Limit-$TargetIP"
+    Write-Log "[START] Protecting against DDoS from IP: $TargetIP. Mitigating via Windows Netsh Firewall for 5 mins."
+
+    netsh advfirewall firewall add rule name=$RuleName dir=in action=block remoteip=$TargetIP protocol=TCP localport=80,443 | Out-Null
+    Write-Log "[SUCCESS] Firewall Rule '$RuleName' applied successfully. Blocked high-frequency web ports for this IP."
+
+    Start-Sleep -Seconds 300
+
+    netsh advfirewall firewall delete rule name=$RuleName | Out-Null
+    Write-Log "[RELEASE] 5 minutes up. Firewall Rule '$RuleName' removed. IP $TargetIP restored to normal."
+} catch {
+    Write-Log "[CRITICAL ERROR] $($_.Exception.Message)"
 }

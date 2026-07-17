@@ -242,6 +242,14 @@ The rule chain (`roles/wazuh_ddos_rules/files/local_rules_ddos.xml`) mirrors `dd
 
 The `custom-shuffle` integration script (`roles/wazuh_server/templates/custom-shuffle.py.j2`) forwards **every** alert to the legacy IRIS webhook, but only rule IDs `100210`/`100212`/`100213` to the DDoS webhook — the per-request base tags (`100200`/`100211`) fire once per HTTP request and would flood Shuffle/AbuseIPDB for zero decision value.
 
+**Resolved — dmz-windows never reached rule 100213 under real flood load**: earlier testing found rule `100213` (needs 50× `100210` in 30s) simply never fired against dmz-windows no matter how heavy the flood, capping every real test at LOG_ONLY. Root-caused to two stacked throughput bottlenecks, both now fixed by default (`deploy_windows_dmz.yml` / `windows-dmz/docker-compose.yml`):
+1. The Windows VM only gets 2 vCPUs by default (`dockurr/windows`) — under flood load nginx and the Wazuh agent starved each other for CPU, and the agent logged `Target 'agent' message queue is full (1024). Log lines may be lost.` Fixed by bumping `CPU_CORES` to 4 in `windows-dmz/docker-compose.yml` (host has plenty to spare) and `logcollector.queue_size` from the default 1024 to 220000.
+2. Once CPU stopped being the bottleneck, nginx could generate events faster than the agent's own `<client_buffer>` rate limiter allows to leave the agent — hard-capped at 1000 events/sec (Wazuh's documented maximum, not further raisable), so the buffer itself started flooding and dropping newest events (`Agent buffer is flooded: Producing too many events.`). Fixed by disabling `client_buffer` entirely (`<disabled>yes</disabled>`) — removes the leaky-bucket cap, agent sends as fast as it can.
+
+Verified live after both fixes: `100213` fired 37-40 times per `run_attack.sh windows auto_block` run, with a real Windows Firewall block landing each time (`Get-NetFirewallRule -DisplayName 'Wazuh-DDoS-Limit-*'`). If you're running an older checkout, re-run `deploy_windows_dmz.yml` to pick up both fixes (idempotent — safe to re-run against an already-deployed host).
+
+**Resolved — Windows AR now uses `netsh advfirewall`, not `New-NetFirewallRule`, with a self-managed timeout**: `ip-limit.ps1` (`roles/nginx_dmz_windows/files/active-response/ip-limit.ps1`) blocks via `netsh advfirewall firewall add rule ... action=block remoteip=<ip> protocol=TCP localport=80,443`, then `Start-Sleep -Seconds 300`, then deletes the same rule by name — all in one script invocation, rather than relying on Wazuh's own `<timeout>` to re-invoke the script with `delete` 5 minutes later. Because of this, `ip-limit-windows`'s `<active-response>` block in `ossec.conf` deliberately has **no** `<timeout>` (`roles/wazuh_ddos_rules/templates/inject_active_response.py.j2`) — adding one would make Wazuh *also* independently re-invoke the script with `delete` 5 minutes after `add`, racing the script's own self-delete (harmless, since `netsh ... delete rule` on an already-removed rule just no-ops, but redundant). One side effect: omitting `<timeout>` changes the registered `ar.conf` command name from `ip-limit-windows300` to `ip-limit-windows0` (Wazuh builds the name as `<command name><timeout>`, defaulting to `0`) — the Shuffle workflow's `wazuh_ar_block_windows` node and the manual curl example below must call it by that exact string, or the API returns `WazuhError(1652)` "command not defined". Rules are named `Wazuh-DDoS-Limit-<ip>`, and the log lives at `C:\Program Files (x86)\ossec-agent\active-response\bin\ip-limit.log`. Verified live end-to-end: a manual `PUT /active-response` call produced a correctly-scoped block (`RemoteIP <ip>/32, Protocol TCP, LocalPort 80,443, Action Block`) with a `[START]`/`[SUCCESS]` log entry, and exactly 300s later a `[RELEASE]` log entry and the rule's removal (`Get-NetFirewallRule -DisplayName 'Wazuh-DDoS-Limit-*'` returns nothing afterward) — no leftover rule, no re-invocation from Wazuh's side.
+
 Test it with [`wrk`](https://github.com/wg/wrk) or `ab`:
 
 ```bash
@@ -261,7 +269,8 @@ TOKEN=$(curl -sk -u wazuh-wui:'MyS3cr37P450r.*-' -X POST "https://<SOC_IP>:55000
 curl -sk -X PUT "https://<SOC_IP>:55000/active-response?agents_list=<AGENT_ID>" \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"command":"ip-limit-linux300","arguments":["<ATTACKER_IP>"],"alert":{"data":{"srcip":"<ATTACKER_IP>"}}}'
-# Use "ip-limit-windows300" for a Windows agent instead.
+# Use "ip-limit-windows0" for a Windows agent instead — no <timeout> means no
+# trailing "300" (see the netsh/self-managed-timeout note above).
 ```
 
 Or invoke the script directly on the agent (bypasses Wazuh entirely — useful to prove the script works in isolation):
@@ -281,7 +290,7 @@ echo '{"command":"add","parameters":{"alert":{"data":{"srcip":"<ATTACKER_IP>"}}}
 
 **Fix**: both scripts now read exactly one line (`IFS= read -r INPUT_JSON` / `[Console]::In.ReadLine()`) instead of reading to EOF, matching Wazuh's own documented AR stdin protocol ("read up to the newline character"). Verified live after the fix: 5 rapid back-to-back AR calls to dmz-ubuntu and 4 to dmz-windows all executed correctly with no hangs (previously ~50% failure rate on Linux, 0% success across every attempt on Windows). If you're running an older checkout, redeploy via `deploy_dmz_ubuntu_nginx.yml` / `deploy_ddos_response.yml` to pick up the fixed scripts.
 
-**Cleanup after demo:**
+**Cleanup after demo:** both blocks self-release after 5 minutes on their own (Linux via Wazuh's `<timeout>` re-invoking `ip-limit.sh` with `delete`, Windows via `ip-limit.ps1`'s own `Start-Sleep 300` — see above) — only needed if you want to clear a block early:
 
 ```bash
 # dmz-ubuntu
@@ -289,7 +298,7 @@ sudo iptables -D INPUT -s <ATTACKER_IP> -p tcp -m multiport --dports 80,443 -j D
 ```
 ```powershell
 # dmz-windows
-Get-NetFirewallRule -DisplayName "Wazuh-AR-IPLimit-*" | Remove-NetFirewallRule
+Get-NetFirewallRule -DisplayName "Wazuh-DDoS-Limit-*" | Remove-NetFirewallRule
 ```
 
 ### 6. (Optional) DDoS SOAR workflow — cache-dedupe → enrich → score → decide
