@@ -27,15 +27,30 @@
 #                srcip, n=250/c=20, fired 100210 14x and 100213 0x.
 #
 #   auto_block - a heavy sustained flood via wrk. Reliably reaches rule
-#                100213 (level 12, D1=+40). Because wazuh_history counts
-#                ANY indexed alert for that srcip (no rule-id filter), by
-#                the time 50 100210 hits have accumulated (required for
-#                100213 to fire at all) the 24h history for that IP is
-#                already >=20 (D2=+30) -> 40+30=70 -> AUTO_BLOCK. In other
-#                words: once real flood traffic is heavy enough to trigger
-#                100213 at all, it ALWAYS also satisfies D2's top bucket,
-#                so this path can never land on NOTIFY_SOC. Verified live:
-#                t=4/c=150 for just 10s already fired 100213 14x.
+#                100213 (level 12, D1=+40) on dmz-ubuntu. Because
+#                wazuh_history counts ANY indexed alert for that srcip (no
+#                rule-id filter), by the time 50 100210 hits have
+#                accumulated (required for 100213 to fire at all) the 24h
+#                history for that IP is already >=20 (D2=+30) -> 40+30=70 ->
+#                AUTO_BLOCK. In other words: once real flood traffic is
+#                heavy enough to trigger 100213 at all, it ALWAYS also
+#                satisfies D2's top bucket, so this path can never land on
+#                NOTIFY_SOC. Verified live: t=4/c=150 for just 10s already
+#                fired 100213 14x.
+#
+#                dmz-windows needed two fixes before this same flood could
+#                ever reach 100213 there at all (see deploy_windows_dmz.yml
+#                and windows-dmz/docker-compose.yml, both applied by
+#                default now): the Windows VM only gets 2 vCPUs by default
+#                (dockurr/windows), which under this flood left nginx and
+#                wazuh-agent starved for CPU — bumped to CPU_CORES=4. Once
+#                that stopped being the bottleneck, the agent's OWN
+#                client_buffer rate-limiter (hard-capped at 1000 EPS,
+#                Wazuh's documented maximum) became the new ceiling and
+#                started dropping events ("Agent buffer is flooded") —
+#                fixed by disabling client_buffer entirely. Verified live
+#                after both fixes: 100213 fired 37-40x per run, with a real
+#                Windows Firewall block landing each time.
 #
 #   notify_soc - NOT reachable via the flood rules at all (see above), so
 #                this drives real Slowloris traffic instead via
