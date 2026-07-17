@@ -227,7 +227,7 @@
         },
         {
           "name": "body",
-          "value": "{\"alert_title\":\"NOTIFY_SOC: DDoS from $exec.data.srcip\",\"alert_description\":\"Wazuh rule $exec.rule.id ($exec.rule.description) Manual triage required - see Shuffle execution for full evidence + score breakdown.\",\"alert_severity_id\":4,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$exec.timestamp\"}"
+          "value": "{\"alert_title\":\"NOTIFY_SOC: DDoS from $exec.data.srcip\",\"alert_description\":\"Wazuh rule $exec.rule.id ($exec.rule.description) Manual triage required - see Shuffle execution for full evidence + score breakdown.\",\"alert_severity_id\":4,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$score_alert.message.alert_timestamp\"}"
         },
         {
           "name": "verify",
@@ -257,7 +257,7 @@
         },
         {
           "name": "body",
-          "value": "{\"alert_title\":\"LOG_ONLY: DDoS signal from $exec.data.srcip\",\"alert_description\":\"Wazuh rule $exec.rule.id ($exec.rule.description) Score below NOTIFY_SOC threshold - logged for visibility only, no action taken. See Shuffle execution for score breakdown.\",\"alert_severity_id\":1,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$exec.timestamp\"}"
+          "value": "{\"alert_title\":\"LOG_ONLY: DDoS signal from $exec.data.srcip\",\"alert_description\":\"Wazuh rule $exec.rule.id ($exec.rule.description) Score below NOTIFY_SOC threshold - logged for visibility only, no action taken. See Shuffle execution for score breakdown.\",\"alert_severity_id\":1,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$score_alert.message.alert_timestamp\"}"
         },
         {
           "name": "verify",
