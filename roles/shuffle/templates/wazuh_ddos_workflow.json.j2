@@ -302,10 +302,11 @@
     {
       "app_name": "Shuffle Triggers",
       "name": "DDoS Webhook",
-      "description": "Receives Wazuh DDoS alerts (rule.id 100210/100212/100213 — filtered by custom-shuffle integration, see custom-shuffle.py.j2)",
+      "description": "Receives Wazuh DDoS alerts (rule.id 100210/100212/100213/100221/100222/100231/100232 — filtered by custom-shuffle integration, see custom-shuffle.py.j2)",
       "id": "{{ shuffle_ddos_webhook_trigger_id }}",
       "type": "WEBHOOK",
       "status": "running",
+      "isStartNode": true,
       "app_version": "1.0.0",
       "parameters": [
         {

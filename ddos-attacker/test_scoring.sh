@@ -18,14 +18,19 @@
 # alone is what would auto-block in a real deployment with public IPs.
 #
 # Usage:
-#   ./test_scoring.sh log_only|notify_soc|auto_block [srcip]
+#   ./test_scoring.sh log_only|notify_soc|auto_block|auto_block_error_flood [srcip]
 #
 # A fresh random srcip is generated if you don't pass one, so dedupe_check
 # and 24h history never collide with a previous test run.
+#
+# Note: this script posts straight to the Shuffle DDoS webhook, bypassing
+# custom-shuffle.py entirely - it proves the SCORING path only, never the
+# DDOS_FORWARD_RULE_IDS gate that decides whether a real Wazuh alert reaches
+# Shuffle at all. Only ./run_attack.sh's real-traffic cases exercise that.
 
 set -euo pipefail
 
-CASE="${1:?Usage: $0 log_only^|notify_soc^|auto_block [srcip]}"
+CASE="${1:?Usage: $0 log_only^|notify_soc^|auto_block^|auto_block_error_flood [srcip]}"
 SRCIP="${2:-203.0.113.$((RANDOM % 200 + 30))}"
 
 MANAGER_CONTAINER="single-node-wazuh.manager-1"
@@ -60,8 +65,28 @@ case "$CASE" in
             | python3 -c "import json,sys; d=json.load(sys.stdin); print('  bulk insert errors:', d.get('errors'))"
         curl -sk -u "$INDEXER_USER:$INDEXER_PASS" -X POST "$INDEXER_URL/wazuh-alerts-*/_refresh" >/dev/null
         ;;
+    auto_block_error_flood)
+        # Same score band as auto_block (level 12 -> D1=+40), but using the
+        # generic-4xx-flood rule id (100222) instead of the HTTP-flood rule
+        # id (100213) - proves D1 scoring only cares about rule_level, never
+        # rule_id (see ddos_score_alert.py's Dimension 1).
+        RULE_LEVEL=12
+        RULE_ID=100222
+        RULE_DESC="Confirmed 4xx error-flood DDoS (synthetic)"
+        INDEX_NAME="wazuh-alerts-4.x-$(date -u +%Y.%m.%d)"
+        echo "Seeding 22 synthetic history docs for $SRCIP in $INDEX_NAME (needed for D2 >=20 -> +30)..."
+        {
+            for i in $(seq 1 22); do
+                echo "{\"index\":{\"_index\":\"$INDEX_NAME\"}}"
+                echo "{\"@timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%S).000Z\",\"data\":{\"srcip\":\"$SRCIP\"},\"rule\":{\"id\":\"100221\",\"level\":8}}"
+            done
+        } | curl -sk -u "$INDEXER_USER:$INDEXER_PASS" -X POST "$INDEXER_URL/_bulk" \
+            -H "Content-Type: application/x-ndjson" --data-binary @- \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('  bulk insert errors:', d.get('errors'))"
+        curl -sk -u "$INDEXER_USER:$INDEXER_PASS" -X POST "$INDEXER_URL/wazuh-alerts-*/_refresh" >/dev/null
+        ;;
     *)
-        echo "Usage: $0 log_only|notify_soc|auto_block [srcip]" >&2
+        echo "Usage: $0 log_only|notify_soc|auto_block|auto_block_error_flood [srcip]" >&2
         exit 1
         ;;
 esac

@@ -10,15 +10,42 @@ We ignore positional args and use the URLs baked in at deploy time.
 Posts to two webhooks with different filters:
   1. IRIS-case workflow (legacy) — every alert (level >= integration <level>)
      keeps existing case automation working for all of SOC, not just DDoS.
-  2. DDoS auto-response workflow — ONLY rule IDs 100210/100212/100213
-     (ddos-plan.txt Part 2: forward from the "watch" tier upward, never the
-     per-request base tag 100200/100211 — that fires once per HTTP request
-     and would flood Shuffle/AbuseIPDB with noise for zero decision value).
+  2. DDoS auto-response workflow — ONLY rule IDs 100210/100212/100213, the
+     generic 4xx error-flood branch 100221/100222, and the 5xx error-flood
+     branch 100231/100232 (ddos-plan.txt Part 2: forward from the "watch"
+     tier upward, never a per-request base tag (100200/100211/100220/
+     100230) — those fire once per HTTP request and would flood Shuffle/
+     AbuseIPDB with noise for zero decision value).
 
 Failure on one webhook does not block the other.
+
+Debounced per (srcip, rule_id), not per srcip alone: a real flood makes a
+single frequency rule (e.g. 100210) re-fire on every matching event once
+its threshold is crossed — hundreds/thousands of times over a 30s flood —
+and integratord spawns this script fresh for EACH one, so forwarding all
+of them fires hundreds of near-simultaneous webhook POSTs. Confirmed live
+this saturates Shuffle's webhook-to-startnode resolution (self-hosted,
+OpenSearch-backed): under that burst, EVERY hook — both the DDoS one and
+the unrelated IRIS one — started logging "No start node for hook ...
+running with workflow default" (1000+ times in 3 minutes from one flood)
+and silently skipped running the actual workflow DAG, so no Active
+Response call was ever made despite Wazuh detecting the attack correctly.
+
+Keying debounce on srcip ALONE (first version of this fix) backfired: the
+noisy "watch" tier (100210, firing hundreds of times) won every debounce
+window for that srcip, so the much-rarer but decision-critical escalation
+alerts (100213/100222/100232) got silently starved out entirely — Wazuh
+fired them correctly but they never reached Shuffle. Keying on (srcip,
+rule_id) instead gives each distinct rule its own independent debounce
+clock, so 100210's noise can't crowd out 100213 forwarding on schedule.
+Alerts with no srcip (non-DDoS SOC alerts from FreeIPA/Nextcloud/Mailcow
+etc, which aren't floods) are never debounced, since keying on an empty
+string would cross-suppress unrelated alert types.
 """
 import json
+import os
 import sys
+import time
 import urllib.request
 import urllib.error
 
@@ -27,8 +54,29 @@ DDOS_WEBHOOK_URL = "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ sh
 SHUFFLE_API_KEY = "{{ shuffle_default_apikey }}"
 
 # ddos-plan.txt Part 2: forward the escalation-worthy rules only, not the
-# per-request base tag (100200 web-access, 100211 http-408-tag).
-DDOS_FORWARD_RULE_IDS = {"100210", "100212", "100213"}
+# per-request base tags (100200 web-access, 100211 http-408-tag, 100220
+# generic-4xx-tag, 100230 generic-5xx-tag). See
+# roles/wazuh_ddos_rules/files/local_rules_ddos.xml for the full rule
+# chain each of these belongs to.
+DDOS_FORWARD_RULE_IDS = {"100210", "100212", "100213", "100221", "100222", "100231", "100232"}
+
+DEBOUNCE_SECONDS = 10
+DEBOUNCE_DIR = "/tmp/custom-shuffle-debounce"
+
+
+def should_forward(srcip, rule_id):
+    if not srcip:
+        return True
+    os.makedirs(DEBOUNCE_DIR, exist_ok=True)
+    marker = os.path.join(DEBOUNCE_DIR, f"{srcip}_{rule_id}")
+    now = time.time()
+    try:
+        if now - os.path.getmtime(marker) < DEBOUNCE_SECONDS:
+            return False
+    except FileNotFoundError:
+        pass
+    open(marker, "w").close()
+    return True
 
 
 def post(url, payload):
@@ -52,10 +100,14 @@ def main():
     with open(alert_file_path) as f:
         alert = json.load(f)
 
+    srcip = alert.get("data", {}).get("srcip", "")
+    rule_id = str(alert.get("rule", {}).get("id", ""))
+    if not should_forward(srcip, rule_id):
+        return
+
     payload = json.dumps(alert).encode("utf-8")
     post(IRIS_WEBHOOK_URL, payload)
 
-    rule_id = str(alert.get("rule", {}).get("id", ""))
     if rule_id in DDOS_FORWARD_RULE_IDS:
         post(DDOS_WEBHOOK_URL, payload)
 

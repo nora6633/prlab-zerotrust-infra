@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # Generates REAL traffic against the DMZ nginx targets, calibrated to land
-# each of the three ddos_score_alert.py decision bands via genuine Wazuh
-# rule firings (rules 100200/100210/100213 and 100211/100212 — see
+# each of the four ddos_score_alert.py decision-relevant rule chains via
+# genuine Wazuh rule firings (rules 100200/100210/100213,
+# 100211/100212, and 100220/100221/100222 — see
 # roles/wazuh_ddos_rules/files/local_rules_ddos.xml) — not synthetic
 # webhook payloads. For direct synthetic testing of the scoring code
 # itself, see ./test_scoring.sh instead.
 #
 # Usage:
-#   ./run_attack.sh [ubuntu|windows|both] [log_only|notify_soc|auto_block]
+#   ./run_attack.sh [ubuntu|windows|both] [log_only|notify_soc|auto_block|error_flood]
 #
 # Examples:
 #   ./run_attack.sh ubuntu log_only
 #   ./run_attack.sh ubuntu notify_soc
 #   ./run_attack.sh ubuntu auto_block
+#   ./run_attack.sh ubuntu error_flood
 #   ./run_attack.sh both auto_block
 #
 # How each case is engineered against the ACTUAL rule chain + scoring
@@ -74,6 +76,24 @@
 #                live: c=60/i=65s/l=75s produced 60 genuine 408s and fired
 #                100212 exactly once.
 #
+#   error_flood - drives the generic 4xx error-flood branch (100220->100221
+#                ->100222) specifically, using oversized-header requests
+#                instead of plain GETs: each request carries a ~20KB header
+#                value, comfortably over nginx's default
+#                large_client_header_buffers (4x8k, unconfigured on both
+#                targets), so nginx answers 400 instead of 200 for every
+#                request. Rule 100220 excludes 408 (negate="yes"), so this
+#                is a genuinely independent signal from notify_soc's
+#                Slowloris path, not a duplicate of it. Needs a much higher
+#                count than auto_block's math would suggest: a curl+xargs
+#                loop (unlike wrk's duration-bound model) blows through even
+#                5000 oversized-header requests in ~2-4s wall-clock, so a
+#                fixed count has to be large enough to rack up 50 crossings
+#                of the 100-hits/10s window before the burst itself runs out
+#                of requests. Verified live: 5000 requests produced only 25x
+#                100221 and 0x 100222 (burst finished too fast); 10000
+#                requests reliably produced ~290x 100221 and ~20x 100222.
+#
 # Why curl (not wrk) drives the count-bounded bursts: wrk has no
 # request-count cap, only a duration floor of 1 whole second, and even
 # `wrk -t1 -c1 -d1s` against these targets pushes ~1-2k req/s -- enough to
@@ -102,14 +122,14 @@ IP_MAX=250
 case "$TARGET" in
     ubuntu|windows|both) ;;
     *)
-        echo "Usage: $0 [ubuntu|windows|both] [log_only|notify_soc|auto_block]" >&2
+        echo "Usage: $0 [ubuntu|windows|both] [log_only|notify_soc|auto_block|error_flood]" >&2
         exit 1
         ;;
 esac
 case "$CASE" in
-    log_only|notify_soc|auto_block) ;;
+    log_only|notify_soc|auto_block|error_flood) ;;
     *)
-        echo "Usage: $0 [ubuntu|windows|both] [log_only|notify_soc|auto_block]" >&2
+        echo "Usage: $0 [ubuntu|windows|both] [log_only|notify_soc|auto_block|error_flood]" >&2
         exit 1
         ;;
 esac
@@ -163,6 +183,24 @@ flood_by_count() {
     "
 }
 
+flood_oversized_header() {
+    # Provokes a genuine nginx 4xx (expected: 400 Bad Request) by sending a
+    # single header value (~20KB) larger than nginx's default
+    # large_client_header_buffers (4x8k) - nginx's own docs say this returns
+    # 400 and closes the connection. Neither dmz-ubuntu's nor dmz-windows'
+    # nginx config overrides this default, so the stock 8k ceiling applies
+    # on both targets (verified live against the real dmz-ubuntu target).
+    # Rule 100220 has no <id> narrowing beyond excluding 408, so any 4xx
+    # nginx actually returns here satisfies it identically.
+    local url="$1" n="$2" concurrency="$3"
+    local big_header
+    big_header="$(head -c 20000 /dev/zero | tr '\0' 'A')"
+    docker exec "$CONTAINER_NAME" bash -c "
+        big='$big_header'
+        seq 1 $n | xargs -P $concurrency -I{} curl -s -o /dev/null -w '%{http_code}\n' -H \"X-Attack-Padding: \$big\" '$url'
+    " | sort | uniq -c
+}
+
 flood_by_time() {
     # Genuinely duration-bound sustained flood — wrk's native mode.
     local url="$1" duration="$2" concurrency="$3"
@@ -197,6 +235,12 @@ run_case() {
     case "$CASE" in
         log_only)
             flood_by_count "$url" 250 20
+            ;;
+        error_flood)
+            # Drives the generic 4xx error-flood chain (100220->100221->
+            # 100222) specifically. Verify counts with:
+            #   docker exec single-node-wazuh.manager-1 tail -f /var/ossec/logs/alerts/alerts.json | grep -E '"id":"1002(20|21|22)"'
+            flood_oversized_header "$url" 10000 150
             ;;
         auto_block)
             flood_by_time "$url" 30 150
@@ -238,7 +282,7 @@ Done. Source IPs used this run: dmz-ubuntu-side=$UBUNTU_IP  windows-side=$WINDOW
 Next run will use a fresh, never-before-cached IP automatically.
 
 Check for alerts on the SOC host:
-  docker exec single-node-wazuh.manager-1 tail -f /var/ossec/logs/alerts/alerts.json | grep -E '"id":"1002(10|11|12|13)"'
+  docker exec single-node-wazuh.manager-1 tail -f /var/ossec/logs/alerts/alerts.json | grep -E '"id":"1002(10|11|12|13|20|21|22)"'
 
 Or watch the Shuffle DDoS workflow pick them up:
   Shuffle UI -> Workflows -> "Wazuh DDoS Auto-Response" -> Runs

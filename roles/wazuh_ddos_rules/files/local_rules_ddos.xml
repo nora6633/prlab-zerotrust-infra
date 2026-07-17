@@ -14,6 +14,19 @@
          31108 itself only matches 2xx/3xx (<id>^2|^3</id>), so the Slowloris
          branch cannot hang off it; it chains off 31101 (built-in "Web server
          400 error code") instead, which already narrows to 4xx.
+       - 100200/100210/100213 only ever see 2xx/3xx (via 31108), and
+         100211/100212 only ever see exactly 408. A flood that makes nginx
+         answer with a plain 400/401/403/404/429/etc. matched neither chain -
+         it only fired the bare built-in 31101 (level 5) once per request,
+         with no aggregation and no forwarding to Shuffle. 100220/100221/
+         100222 close that gap: same shape as 100200/100210/100213, but
+         chains off 31101 directly and excludes 408 via negate="yes" so the
+         same log line never double-alerts on both this branch and the
+         Slowloris one. negate="yes" is a confirmed, live attribute in this
+         Wazuh 4.9.2 ruleset on <field name="..."> elements (see built-in
+         0017-wazuh-api_rules.xml); confirmed it also works on <id> via
+         wazuh-logtest: a synthetic 404 line lands on 100220 only, a
+         synthetic 408 line lands on 100211 only, no overlap either way.
 
      Detection produces alerts only - no <active-response> is bound to any
      rule here. Blocking happens exclusively via Shuffle calling Wazuh's
@@ -83,6 +96,93 @@
     <description>Nginx: Confirmed DDoS from $(srcip) - SOAR escalation</description>
     <mitre><id>T1499.002</id><id>T1498</id></mitre>
     <group>ddos,http_flood,attack,high_severity,</group>
+  </rule>
+
+  <!-- ============================================================
+       100220: base tagging rule - fires once PER request for ANY 4xx
+       EXCEPT 408 (400, 401, 403, 404, 429, etc). 408 is excluded via
+       negate so a Slowloris connection's 408 never double-alerts on
+       both this branch and 100211/100212.
+       ============================================================ -->
+  <rule id="100220" level="1">
+    <if_sid>31101</if_sid>
+    <id negate="yes">^408$</id>
+    <description>Nginx: generic 4xx client error, excluding 408 (counted for HTTP error-flood detection; 408/Slowloris has its own dedicated 100211/100212 branch)</description>
+    <group>web,accesslog,</group>
+  </rule>
+
+  <!-- ============================================================
+       100221: error-flood spike - 100 hits of 100220 from the SAME IP
+       in 10s. "Watch" tier, mirrors 100210's shape. Forwarded to
+       Shuffle.
+       ============================================================ -->
+  <rule id="100221" level="8" frequency="100" timeframe="10">
+    <if_matched_sid>100220</if_matched_sid>
+    <same_source_ip />
+    <description>Nginx: HTTP 4xx error-response rate spike from $(srcip): 100 4xx in 10s</description>
+    <mitre><id>T1499.002</id></mitre>
+    <group>ddos,http_flood,error_flood,attack,</group>
+  </rule>
+
+  <!-- ============================================================
+       100222: confirmed 4xx error-flood DDoS - 50 hits of 100221 from
+       the SAME IP in 30s. Mirrors 100213's shape and thresholds.
+       Level 12 = confirmed, escalate; forwarded to Shuffle.
+       ============================================================ -->
+  <rule id="100222" level="12" frequency="50" timeframe="30">
+    <if_matched_sid>100221</if_matched_sid>
+    <same_source_ip />
+    <description>Nginx: Confirmed 4xx error-flood DDoS from $(srcip) - SOAR escalation</description>
+    <mitre><id>T1499.002</id><id>T1498</id></mitre>
+    <group>ddos,http_flood,error_flood,attack,high_severity,</group>
+  </rule>
+
+  <!-- ============================================================
+       100230: base tagging rule - fires once PER request for 5xx server
+       errors. Chains off the built-in 31120 ("Web server 500 error code"),
+       which itself chains off 31100 filtered to id ^50 - a sibling of
+       31101 (^40x), not a descendant, so no overlap/negate needed here.
+
+       Added after live testing showed a heavy enough flood can push the
+       Juice Shop backend itself into failure (nginx logs "recv() failed
+       (104: Connection reset by peer)" reading from the upstream) and
+       start answering with 500s instead of 2xx/3xx/4xx. Rules 100200/
+       100211/100220 only ever see 31108 or 31101 - neither matches 31120
+       - so that failure mode previously produced ZERO forwarded alerts:
+       traffic heavy enough to actually crash the backend was invisible
+       to detection, the one case where "the DDoS worked" and Wazuh had
+       nothing to say about it.
+       ============================================================ -->
+  <rule id="100230" level="1">
+    <if_sid>31120</if_sid>
+    <description>Nginx: HTTP 5xx server error (counted for HTTP error-flood detection)</description>
+    <group>web,accesslog,</group>
+  </rule>
+
+  <!-- ============================================================
+       100231: 5xx error-flood spike - 100 hits of 100230 from the SAME IP
+       in 10s. "Watch" tier, mirrors 100210/100221's shape. Forwarded to
+       Shuffle.
+       ============================================================ -->
+  <rule id="100231" level="8" frequency="100" timeframe="10">
+    <if_matched_sid>100230</if_matched_sid>
+    <same_source_ip />
+    <description>Nginx: HTTP 5xx error-response rate spike from $(srcip): 100 5xx in 10s</description>
+    <mitre><id>T1499.002</id></mitre>
+    <group>ddos,http_flood,error_flood,attack,</group>
+  </rule>
+
+  <!-- ============================================================
+       100232: confirmed 5xx error-flood DDoS - 50 hits of 100231 from
+       the SAME IP in 30s. Mirrors 100213/100222's shape and thresholds.
+       Level 12 = confirmed, escalate; forwarded to Shuffle.
+       ============================================================ -->
+  <rule id="100232" level="12" frequency="50" timeframe="30">
+    <if_matched_sid>100231</if_matched_sid>
+    <same_source_ip />
+    <description>Nginx: Confirmed 5xx error-flood DDoS from $(srcip) - SOAR escalation</description>
+    <mitre><id>T1499.002</id><id>T1498</id></mitre>
+    <group>ddos,http_flood,error_flood,attack,high_severity,</group>
   </rule>
 
 </group>
