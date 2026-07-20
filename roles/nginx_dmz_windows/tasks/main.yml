@@ -98,5 +98,6 @@
     - nginx-ratelimit.cmd
     - nginx-ratelimit.ps1
     - ip-limit.cmd
+    - ip-limit-release.ps1
     - ip-limit.ps1
   notify: restart wazuh agent

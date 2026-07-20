@@ -26,8 +26,23 @@ $score_alert.score / $score_alert.action / etc. Nothing downstream
 extracts individual fields FROM this node's output via a dot-path — verified
 live that Shuffle unreliably resolves $score_alert.<field> in a *consumer*
 node's parameters (always empty, execute_python-specific, unrelated to the
-bug above). Only the whole-value "$score_alert contains ACTION" branch-
-condition pattern is used downstream, which is reliable.
+bug above). Downstream branches instead do a whole-value "$score_alert
+contains ..." match — but matching the bare word (e.g. "AUTO_BLOCK") is NOT
+safe: this output's own evidence list can contain the substring "AUTO_BLOCK"
+inside the degraded-evidence downgrade message below even when the real
+`action` is NOTIFY_SOC, which made the AUTO_BLOCK branch fire alongside
+NOTIFY_SOC on every degraded-evidence downgrade (confirmed live — a real
+flood hit this exactly, `wazuh_auth`/`wazuh_ar_block_windows` both ran for an
+execution whose action was genuinely NOTIFY_SOC). The branch conditions in
+wazuh_ddos_workflow.json.j2 match the exact `"action": "AUTO_BLOCK"` /
+`"NOTIFY_SOC"` / `"LOG_ONLY"` key-value substring (relying on json.dumps'
+default `": "` separator) instead of the bare word, which the evidence text
+below can never coincidentally reproduce. Do not rename the `action` key or
+change json.dumps' separators without updating those branch conditions to
+match, and do not add a bare decision-band word (AUTO_BLOCK/NOTIFY_SOC/
+LOG_ONLY) into `evidence` — keep it to phrasing like "an automatic block"
+instead, so this class of collision can't reappear even before the branch
+fix's key-value matching is considered.
 """
 import json
 
@@ -138,7 +153,10 @@ else:
 # gap.
 if action == "AUTO_BLOCK" and degraded:
     action = "NOTIFY_SOC"
-    evidence.append(f"DEGRADED evidence, downgraded from AUTO_BLOCK: {','.join(degraded)}")
+    # Deliberately NOT the literal word "AUTO_BLOCK" here — see module
+    # docstring: downstream branches match on this output as a whole-value
+    # substring, and this exact phrase used to collide with that branch.
+    evidence.append(f"DEGRADED evidence, downgraded from an automatic block: {','.join(degraded)}")
 
 # stdout IS the node's output in Shuffle — downstream nodes only ever check
 # the WHOLE value ("$score_alert contains AUTO_BLOCK/NOTIFY_SOC/LOG_ONLY"),

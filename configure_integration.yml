@@ -92,15 +92,25 @@
           - "IRIS webhook trigger: {{ shuffle_iris_actual_trig }}"
           - "DDoS webhook trigger: {{ shuffle_ddos_actual_trig }}"
 
+    # "start" here is load-bearing, not cosmetic: Shuffle stores each webhook
+    # trigger as its own document in a separate OpenSearch "hooks" index, and
+    # the webhook dispatcher reads THAT document's own "start" field to know
+    # which action to run first - not the workflow's own "start" field, and
+    # not the trigger's "isStartNode" flag on the workflow object. Omitting
+    # it here leaves the hook's "start" empty, and every webhook call then
+    # fails with "No start node for hook ... running with workflow default"
+    # (confirmed live: last_node empty, zero results, execution stuck in
+    # EXECUTING forever) - detection still fires correctly and custom-shuffle
+    # forwards successfully, but the workflow DAG silently never runs.
     - name: Activate both webhook hooks (idempotent)
       shell: |
         curl -ks -X POST -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
           -H "Content-Type: application/json" \
-          -d '{"id":"{{ item.trig }}","name":"{{ item.name }}","info":{"name":"{{ item.name }}"},"type":"webhook","workflows":["{{ item.wf }}"],"status":"running","workflow":"{{ item.wf }}"}' \
+          -d '{"id":"{{ item.trig }}","name":"{{ item.name }}","info":{"name":"{{ item.name }}"},"type":"webhook","workflows":["{{ item.wf }}"],"status":"running","workflow":"{{ item.wf }}","start":"{{ item.start }}"}' \
           "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/new"
       loop:
-        - { trig: "{{ shuffle_iris_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Alert to DFIR-IRIS Case') | first).id }}", name: "Wazuh Webhook" }
-        - { trig: "{{ shuffle_ddos_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | first).id }}", name: "DDoS Webhook" }
+        - { trig: "{{ shuffle_iris_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Alert to DFIR-IRIS Case') | first).id }}", name: "Wazuh Webhook", start: "iris-create-case" }
+        - { trig: "{{ shuffle_ddos_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | first).id }}", name: "DDoS Webhook", start: "dedupe_check" }
       changed_when: false
 
     - name: Template custom-shuffle integration script (with actual trigger IDs)

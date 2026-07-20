@@ -145,7 +145,7 @@
         },
         {
           "name": "body",
-          "value": "{\"command\":\"ip-limit-windows0\",\"arguments\":[\"$exec.data.srcip\"],\"alert\":{\"data\":{\"srcip\":\"$exec.data.srcip\"}}}"
+          "value": "{\"command\":\"ip-limit-windows300\",\"arguments\":[\"$exec.data.srcip\"],\"alert\":{\"data\":{\"srcip\":\"$exec.data.srcip\"}}}"
         },
         {
           "name": "verify",
@@ -374,7 +374,7 @@
       "conditions": [
         {
           "source": {"name": "action", "value": "$score_alert"},
-          "destination": {"value": "AUTO_BLOCK"},
+          "destination": {"value": "\"action\": \"AUTO_BLOCK\""},
           "condition": {"value": "contains"}
         }
       ]
@@ -432,7 +432,7 @@
       "conditions": [
         {
           "source": {"name": "action", "value": "$score_alert"},
-          "destination": {"value": "NOTIFY_SOC"},
+          "destination": {"value": "\"action\": \"NOTIFY_SOC\""},
           "condition": {"value": "contains"}
         }
       ]
@@ -452,7 +452,7 @@
       "conditions": [
         {
           "source": {"name": "action", "value": "$score_alert"},
-          "destination": {"value": "LOG_ONLY"},
+          "destination": {"value": "\"action\": \"LOG_ONLY\""},
           "condition": {"value": "contains"}
         }
       ]

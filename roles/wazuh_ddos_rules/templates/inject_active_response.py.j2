@@ -15,15 +15,21 @@ AGENT's own disk and differs by OS — dmz-windows needs ip-limit.cmd (netsh),
 dmz-ubuntu needs ip-limit.sh (iptables). Shuffle picks the right command name
 per-alert based on agent name (see ddos_score_alert.py's ar_command field).
 
-ip-limit-windows has NO <timeout> (unlike ip-limit-linux): ip-limit.ps1
-self-manages its own 5-minute unblock (Start-Sleep 300 then netsh delete,
-inside the same invocation) rather than relying on Wazuh re-invoking it with
-"delete" later. Adding <timeout> here too would make Wazuh ALSO independently
-fire a delete 5 minutes after add, racing the script's own self-delete —
-harmless (netsh delete on an already-removed rule just no-ops) but redundant,
-and it changes the ar.conf-registered command name (built as <name><timeout>),
-which must stay in sync with what wazuh_ddos_workflow.json.j2's
-wazuh_ar_block_windows node calls."""
+ip-limit-windows now has <timeout>300</timeout>, same as ip-limit-linux:
+ip-limit.ps1 used to self-manage its own 5-minute unblock (Start-Sleep 300
+then netsh delete, inside the same invocation), but invocations of the same
+ar.conf command serialize on the Windows agent — confirmed live, a manual AR
+dispatch for a fresh IP queued for 1m41s behind an unrelated, still-sleeping
+invocation. A burst of AUTO_BLOCKs (e.g. `run_attack.sh both auto_block`,
+where dmz-ubuntu and dmz-windows alerts can still be in flight close
+together) could leave a brand-new attacker's block queued behind a stale one
+indefinitely, silently failing to block the CURRENT attacker. Moving to
+Wazuh's own <timeout>-driven "delete" re-invocation (as Linux already does)
+makes every invocation return immediately after add/delete, so nothing
+queues. This changes the ar.conf-registered command name (built as
+<name><timeout>) from ip-limit-windows0 to ip-limit-windows300 — must stay in
+sync with what wazuh_ddos_workflow.json.j2's wazuh_ar_block_windows node
+calls."""
 import re
 import sys
 
@@ -37,7 +43,7 @@ block = f"""
     <name>ip-limit-windows</name>
     <executable>ip-limit.cmd</executable>
     <expect>srcip</expect>
-    <timeout_allowed>no</timeout_allowed>
+    <timeout_allowed>yes</timeout_allowed>
   </command>
 
   <command>
@@ -48,12 +54,13 @@ block = f"""
   </command>
 
   <!-- No rules_id / level on either block: manual/API dispatch only, never
-       automatic. ip-limit-windows also has no <timeout> — see module
-       docstring; ip-limit.ps1 manages its own 5-min unblock. -->
+       automatic. Both now use <timeout> — see module docstring; ip-limit.ps1
+       no longer self-manages its own unblock. -->
   <active-response>
     <disabled>no</disabled>
     <command>ip-limit-windows</command>
     <location>all</location>
+    <timeout>300</timeout>
   </active-response>
 
   <active-response>
