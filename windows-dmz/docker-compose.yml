@@ -4,6 +4,8 @@ services:
     container_name: windows
     environment:
       VERSION: "11"
+      USERNAME: "ann"
+      PASSWORD: "windowspass"
       # Default is 2 cores / 4G RAM — confirmed live to be the actual DDoS
       # detection bottleneck on this agent: under flood load nginx and
       # wazuh-agent contend for the same 2 vCPUs, capping event-processing
