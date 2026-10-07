@@ -1,0 +1,38 @@
+---
+- name: Create simulated removable-disk folder
+  ansible.windows.win_file:
+    path: "{{ simulated_usb_path }}"
+    state: directory
+
+- name: Add simulated USB directory to Wazuh agent FIM (syscheck) config
+  ansible.windows.win_shell: |
+    $conf = '{{ wazuh_agent_install_dir }}\ossec.conf'
+    $content = Get-Content $conf -Raw
+    if ($content -notmatch [regex]::Escape('SimulatedUSB')) {
+      $block = '  <directories realtime="yes" report_changes="no">{{ simulated_usb_path }}</directories>' + "`n  </syscheck>"
+      $content = $content -replace '</syscheck>', $block
+      Set-Content $conf $content
+      Write-Output 'ADDED'
+    } else {
+      Write-Output 'ALREADY_EXISTS'
+    }
+  register: syscheck_conf_result
+  changed_when: "'ADDED' in syscheck_conf_result.stdout"
+  notify: restart wazuh agent
+
+- name: Ensure AR script directory exists on agent
+  ansible.windows.win_file:
+    path: '{{ wazuh_agent_install_dir }}\active-response\bin'
+    state: directory
+
+- name: Deploy USB-write-block Active Response scripts to Wazuh agent
+  ansible.windows.win_copy:
+    src: "active-response/{{ item }}"
+    dest: '{{ wazuh_agent_install_dir }}\active-response\bin\{{ item }}'
+  loop:
+    - block-usb-write.cmd
+    - block-usb-write.ps1
+  notify: restart wazuh agent
+
+- name: Flush handlers so FIM/AR config is live before any test file is written
+  meta: flush_handlers

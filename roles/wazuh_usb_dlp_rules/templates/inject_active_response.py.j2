@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Inject USB-DLP Active Response config into Wazuh manager ossec.conf (idempotent).
+Targets the host-side bind-mounted file - changes to the in-container ossec.conf
+are wiped on every container restart by the entrypoint.
+
+No <rules_id> / <level> on the <active-response> block below, so Wazuh will
+NEVER dispatch it automatically off an alert match (same manual/API-only
+design as the DDoS ip-limit-* commands - see wazuh_ddos_rules'
+inject_active_response.py.j2). Shuffle calls it via PUT /active-response
+only after the score_alert node decides ESCALATE_AND_CONTAIN (score >= 60).
+
+Deliberately no <timeout>: unlike the DDoS rate-limit blocks (which
+self-release after 5 minutes because a rate-limit false-positive is cheap
+to eat), a USB-write block is a data-exfiltration containment action -
+lifting it automatically after a fixed window would defeat the point of
+"wait for a human" that ESCALATE_AND_CONTAIN implies. Release is manual
+only, via the same command's "delete" branch (see block-usb-write.ps1).
+
+Wazuh internally registers manual-dispatch (no rules_id/level) AR commands
+as <name><timeout> - confirmed live (/var/ossec/etc/shared/ar.conf shows
+"block-usb-write0 - block-usb-write.cmd - 0") exactly like the DDoS
+ip-limit-windows/-linux commands got suffixed to ip-limit-windows300/
+ip-limit-linux300. With no <timeout> element here, the suffix is "0", so
+the API dispatch command name is "block-usb-write0", NOT the bare
+"block-usb-write" - see wazuh_usb_dlp_workflow.json.j2's wazuh_ar_block_usb
+node. A PUT /active-response call using the bare name fails with Wazuh API
+error 1652 "The command used is not defined in the configuration" (verified
+live via a direct synthetic-webhook test before this comment was added).
+"""
+import re
+import sys
+
+OSSEC_CONF = "{{ wazuh_manager_host_conf }}"
+START = "<!-- BEGIN: prlab-usb-dlp-active-response -->"
+END = "<!-- END: prlab-usb-dlp-active-response -->"
+
+block = f"""
+{START}
+  <command>
+    <name>block-usb-write</name>
+    <executable>block-usb-write.cmd</executable>
+    <expect>filename</expect>
+    <timeout_allowed>yes</timeout_allowed>
+  </command>
+
+  <!-- No rules_id / level: manual/API dispatch only, never automatic. -->
+  <active-response>
+    <disabled>no</disabled>
+    <command>block-usb-write</command>
+    <location>all</location>
+  </active-response>
+{END}
+""".strip()
+
+with open(OSSEC_CONF, "r") as f:
+    content = f.read()
+
+content = re.sub(
+    re.escape(START) + r".*?" + re.escape(END) + r"\s*",
+    "",
+    content,
+    flags=re.DOTALL,
+)
+
+content = content.replace("</ossec_config>", f"{block}\n</ossec_config>", 1)
+
+with open(OSSEC_CONF, "w") as f:
+    f.write(content)
+
+print("OK")

@@ -170,6 +170,67 @@
         sc.exe failure WazuhSvc reset= 86400
         actions= restart/5000/restart/10000/restart/30000
 
+    - name: Download Sysmon
+      ansible.windows.win_get_url:
+        url: "https://download.sysinternals.com/files/Sysmon.zip"
+        dest: "{{ install_dir }}\\Sysmon.zip"
+        force: false
+
+    - name: Extract Sysmon
+      community.windows.win_unzip:
+        src: "{{ install_dir }}\\Sysmon.zip"
+        dest: "{{ install_dir }}\\sysmon"
+        creates: "{{ install_dir }}\\sysmon\\Sysmon64.exe"
+
+    - name: Deploy Sysmon configuration (file-event focused)
+      ansible.windows.win_copy:
+        dest: "{{ install_dir }}\\sysmon\\sysmon-config.xml"
+        content: |
+          <Sysmon schemaversion="4.90">
+            <EventFiltering>
+              <!-- FileCreate/FileCreateStreamHash/FileDelete(Detected) with no
+                   conditions below an onmatch="exclude" filter means nothing
+                   gets excluded, i.e. log every event of that type. Only
+                   Windows Update's own churn and Sysmon/Wazuh's own log
+                   writes are filtered out to cut noise. -->
+              <FileCreate onmatch="exclude">
+                <TargetFilename condition="begin with">C:\Windows\SoftwareDistribution\</TargetFilename>
+                <TargetFilename condition="contains">\ossec-agent\</TargetFilename>
+                <TargetFilename condition="contains">\soc-infra\sysmon\</TargetFilename>
+              </FileCreate>
+              <FileCreateStreamHash onmatch="exclude" />
+              <FileDelete onmatch="exclude" />
+              <FileDeleteDetected onmatch="exclude" />
+            </EventFiltering>
+          </Sysmon>
+
+    - name: Install or update Sysmon service with config
+      ansible.windows.win_shell: |
+        $svc = Get-Service Sysmon64 -ErrorAction SilentlyContinue
+        if (-not $svc) {
+          & '{{ install_dir }}\sysmon\Sysmon64.exe' -accepteula -i '{{ install_dir }}\sysmon\sysmon-config.xml'
+        } else {
+          & '{{ install_dir }}\sysmon\Sysmon64.exe' -c '{{ install_dir }}\sysmon\sysmon-config.xml'
+        }
+      register: sysmon_install
+      changed_when: "'installed' in sysmon_install.stdout or 'updated' in sysmon_install.stdout"
+
+    - name: Configure Wazuh agent to monitor Sysmon event log
+      ansible.windows.win_shell: |
+        $conf = 'C:\Program Files (x86)\ossec-agent\ossec.conf'
+        $content = Get-Content $conf -Raw
+        $block = "  <localfile>`n    <location>Microsoft-Windows-Sysmon/Operational</location>`n    <log_format>eventchannel</log_format>`n  </localfile>"
+        if ($content -notmatch 'Sysmon/Operational') {
+          $content = $content -replace '</ossec_config>', "$block`n</ossec_config>"
+          Set-Content $conf $content
+          Restart-Service WazuhSvc
+          Write-Output 'ADDED'
+        } else {
+          Write-Output 'ALREADY_EXISTS'
+        }
+      register: wazuh_sysmon_conf_result
+      changed_when: "'ADDED' in wazuh_sysmon_conf_result.stdout"
+
     - name: Allow Juice Shop inbound (port 3000)
       community.windows.win_firewall_rule:
         name: "Juice Shop HTTP"
@@ -281,4 +342,5 @@
           - " nginx       -> http://{{ ansible_host }}:80 (reverse proxy)"
           - " Wazuh Agent -> {{ wazuh_svc.state }} (manager: {{ wazuh_manager_ip }})"
           - " nginx logs  -> Wazuh: {{ wazuh_conf_result.stdout | trim }}"
+          - " Sysmon      -> Wazuh: {{ wazuh_sysmon_conf_result.stdout | trim }}"
           - "================================================"

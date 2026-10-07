@@ -72,6 +72,35 @@
     - debug:
         msg: "{{ ddos_import_resp.stdout | truncate(200) }}"
 
+    - name: Load Python scorer source for USB-DLP workflow
+      set_fact:
+        usb_dlp_score_alert_code: "{{ lookup('file', 'roles/shuffle/files/usb_dlp_score_alert.py') }}"
+
+    - name: Template USB-DLP workflow JSON onto host (with embedded Python scorer)
+      template:
+        src: roles/shuffle/templates/wazuh_usb_dlp_workflow.json.j2
+        dest: "{{ deploy_base_dir }}/shuffle/wazuh_usb_dlp_workflow.json"
+        mode: '0644'
+
+    - name: Import USB-DLP workflow into Shuffle via API (curl)
+      shell: |
+        curl -ks -o /tmp/usb_dlp_import.out -w "%{http_code}" -X POST \
+          "http://{{ wazuh_server_ip }}:5001/api/v1/workflows" \
+          -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
+          -H "Content-Type: application/json" \
+          --data @{{ deploy_base_dir }}/shuffle/wazuh_usb_dlp_workflow.json
+      register: usb_dlp_workflow_import
+      changed_when: usb_dlp_workflow_import.stdout in ["200", "201"]
+      failed_when: usb_dlp_workflow_import.stdout not in ["200", "201"]
+
+    - name: Show USB-DLP import response
+      shell: cat /tmp/usb_dlp_import.out
+      register: usb_dlp_import_resp
+      changed_when: false
+
+    - debug:
+        msg: "{{ usb_dlp_import_resp.stdout | truncate(200) }}"
+
     # ── Wazuh: install custom integration ────────────────────────────────
     # ── Capture Shuffle-assigned trigger IDs (Shuffle re-generates UUIDs on import) ──
     - name: Query Shuffle for actual webhook trigger IDs
@@ -85,12 +114,14 @@
       set_fact:
         shuffle_iris_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Alert to DFIR-IRIS Case') | first).triggers[0].id }}"
         shuffle_ddos_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | first).triggers[0].id }}"
+        shuffle_usb_dlp_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh USB-DLP Auto-Response') | first).triggers[0].id }}"
 
     - name: Show captured trigger IDs
       debug:
         msg:
           - "IRIS webhook trigger: {{ shuffle_iris_actual_trig }}"
           - "DDoS webhook trigger: {{ shuffle_ddos_actual_trig }}"
+          - "USB-DLP webhook trigger: {{ shuffle_usb_dlp_actual_trig }}"
 
     # "start" here is load-bearing, not cosmetic: Shuffle stores each webhook
     # trigger as its own document in a separate OpenSearch "hooks" index, and
@@ -102,7 +133,7 @@
     # (confirmed live: last_node empty, zero results, execution stuck in
     # EXECUTING forever) - detection still fires correctly and custom-shuffle
     # forwards successfully, but the workflow DAG silently never runs.
-    - name: Activate both webhook hooks (idempotent)
+    - name: Activate all webhook hooks (idempotent)
       shell: |
         curl -ks -X POST -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
           -H "Content-Type: application/json" \
@@ -111,6 +142,7 @@
       loop:
         - { trig: "{{ shuffle_iris_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Alert to DFIR-IRIS Case') | first).id }}", name: "Wazuh Webhook", start: "iris-create-case" }
         - { trig: "{{ shuffle_ddos_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | first).id }}", name: "DDoS Webhook", start: "dedupe_check" }
+        - { trig: "{{ shuffle_usb_dlp_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh USB-DLP Auto-Response') | first).id }}", name: "USB DLP Webhook", start: "history_check" }
       changed_when: false
 
     - name: Template custom-shuffle integration script (with actual trigger IDs)
@@ -121,6 +153,7 @@
       vars:
         shuffle_webhook_trigger_id: "{{ shuffle_iris_actual_trig }}"
         shuffle_ddos_webhook_trigger_id: "{{ shuffle_ddos_actual_trig }}"
+        shuffle_usb_dlp_webhook_trigger_id: "{{ shuffle_usb_dlp_actual_trig }}"
 
     - name: Copy integration script into single-node-wazuh.manager-1 container
       command: docker cp /tmp/custom-shuffle single-node-wazuh.manager-1:/var/ossec/integrations/custom-shuffle

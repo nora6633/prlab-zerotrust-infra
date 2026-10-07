@@ -1,0 +1,27 @@
+---
+# Deploys the USB-DLP scenario:
+#
+#   1. SOC manager   - adds custom FIM-based rule (100500) + AR config
+#   2. Windows DMZ   - creates C:\SimulatedUSB (simulated removable disk),
+#                      enables realtime FIM on it, wires Wazuh agent's
+#                      active-response bin with the write-block script
+#
+# Prerequisites: site.yml + deploy_windows_dmz.yml already done so that
+# Wazuh manager and the Wazuh agent on dmz-windows are running and
+# registered.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini deploy_usb_dlp_response.yml
+
+- name: Configure USB-DLP detection on Wazuh manager
+  hosts: soc
+  become: true
+  gather_facts: true
+  roles:
+    - wazuh_usb_dlp_rules
+
+- name: Deploy simulated USB directory + AR on Windows DMZ
+  hosts: dmz-windows
+  gather_facts: false
+  roles:
+    - usb_dlp_agent_windows
