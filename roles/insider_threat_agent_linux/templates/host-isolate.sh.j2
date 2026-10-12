@@ -1,0 +1,129 @@
+#!/bin/bash
+# Wazuh Active Response: full host isolation for the insider-threat scenario.
+# Dispatched ONLY via Shuffle's PUT /active-response (AUTO_BLOCK, score >= 80)
+# - no <rules_id>/<level> is bound to this command on the manager side, so
+# it never fires automatically off an alert match.
+#
+# wazuh-execd sends exactly one line of JSON on stdin and does NOT reliably
+# close the pipe afterwards - reading to EOF here will hang forever (same
+# upstream wazuh-execd behaviour as ip-limit.sh / block-usb-write.ps1).
+# `read -r` reads one line and returns; never use `cat`/`$(</dev/stdin)` here.
+read -r INPUT_JSON
+
+LOG=/var/ossec/logs/active-responses.log
+CHAIN=WAZUH_ISOLATE
+PIDFILE=/var/run/host-isolate-release.pid
+WAZUH_SERVER_IP="{{ wazuh_server_ip }}"
+MGMT_IP="{{ insider_threat_mgmt_ip }}"
+TIMEOUT_SECONDS="{{ insider_threat_isolate_timeout_seconds }}"
+
+log() {
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) host-isolate.sh: $*" >> "$LOG"
+}
+
+COMMAND=$(echo "$INPUT_JSON" | grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]+)"$/\1/')
+
+# Kills any pending auto-release timer without erroring if none exists -
+# called on both add (reset, don't stack a second timer) and delete
+# (cancel it, the isolation is being lifted right now anyway).
+cancel_pending_release() {
+  if [ -f "$PIDFILE" ]; then
+    old_pid=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+      kill "$old_pid" 2>/dev/null
+      log "cancelled pending auto-release timer (pid $old_pid)"
+    fi
+    rm -f "$PIDFILE"
+  fi
+}
+
+remove_isolation() {
+  # Idempotent: safe to call even if nothing is currently isolated.
+  iptables -D INPUT  -j "$CHAIN" 2>/dev/null
+  iptables -D OUTPUT -j "$CHAIN" 2>/dev/null
+  iptables -F "$CHAIN" 2>/dev/null
+  iptables -X "$CHAIN" 2>/dev/null
+}
+
+apply_isolation() {
+  cancel_pending_release
+
+  remove_isolation
+  iptables -N "$CHAIN"
+
+  # loopback always allowed
+  iptables -A "$CHAIN" -i lo -j ACCEPT
+  iptables -A "$CHAIN" -o lo -j ACCEPT
+
+  # Wazuh agent <-> manager heartbeat/event forwarding. Static match (no
+  # ESTABLISHED/RELATED shortcut, per design - every packet is re-evaluated
+  # against this explicit allow-list regardless of connection state).
+  iptables -A "$CHAIN" -p tcp -d "$WAZUH_SERVER_IP" --dport 1514 -j ACCEPT
+  iptables -A "$CHAIN" -p tcp -s "$WAZUH_SERVER_IP" --sport 1514 -j ACCEPT
+  iptables -A "$CHAIN" -p tcp -d "$WAZUH_SERVER_IP" --dport 1515 -j ACCEPT
+  iptables -A "$CHAIN" -p tcp -s "$WAZUH_SERVER_IP" --sport 1515 -j ACCEPT
+  iptables -A "$CHAIN" -p udp -d "$WAZUH_SERVER_IP" --dport 1514 -j ACCEPT
+  iptables -A "$CHAIN" -p udp -s "$WAZUH_SERVER_IP" --sport 1514 -j ACCEPT
+
+  # Management SSH, both directions (inbound connection + its replies).
+  # Covers Ansible and manual access alike - both arrive from the same
+  # docker-bridge-side host address, this container does not publish port
+  # 22 externally (confirmed via docker-compose.yaml port list).
+  iptables -A "$CHAIN" -p tcp -s "$MGMT_IP" --dport 22 -j ACCEPT
+  iptables -A "$CHAIN" -p tcp -d "$MGMT_IP" --sport 22 -j ACCEPT
+
+  iptables -A "$CHAIN" -j DROP
+
+  # Insert the jump at position 1 of both built-in chains - only if not
+  # already present, so re-triggering "add" (e.g. 100410 firing again
+  # while already isolated) resets the chain contents/timer without
+  # stacking a second jump rule.
+  iptables -C INPUT  -j "$CHAIN" 2>/dev/null || iptables -I INPUT  1 -j "$CHAIN"
+  iptables -C OUTPUT -j "$CHAIN" 2>/dev/null || iptables -I OUTPUT 1 -j "$CHAIN"
+
+  # Force out any already-established connections that aren't to a
+  # whitelisted peer (e.g. the attacker's own session to the lateral-
+  # movement target). Belt-and-suspenders: our rules are already static
+  # (no ESTABLISHED/RELATED accept), so the very next packet of a
+  # non-whitelisted flow is dropped regardless - this just makes the
+  # kernel forget the flow immediately instead of waiting for the peer's
+  # own retransmission/keepalive timeout to notice. A full flush is safe
+  # here specifically because nothing we allow depends on conntrack state
+  # - the whitelist rules above match on static IP/port, not connection
+  # state, so the manager heartbeat and the admin's own SSH reconnect
+  # using the same static rules immediately.
+  conntrack -F >/dev/null 2>&1
+
+  # Detached background timer - deliberately NOT `&` on the main shell (a
+  # plain backgrounded `sleep` would still be reaped/blocked if execd ever
+  # waits on this script's process group, which bit the original DDoS
+  # ip-limit.sh design - see roles/wazuh_ddos_rules). setsid fully detaches
+  # it into its own session so this invocation returns immediately and the
+  # NEXT Active Response call isn't serialized behind this sleep.
+  setsid bash -c "
+    sleep $TIMEOUT_SECONDS
+    $(declare -f remove_isolation)
+    remove_isolation
+    echo \"\$(date -u +%Y-%m-%dT%H:%M:%SZ) host-isolate.sh: auto-released after ${TIMEOUT_SECONDS}s\" >> '$LOG'
+    rm -f '$PIDFILE'
+  " < /dev/null > /dev/null 2>&1 &
+  echo $! > "$PIDFILE"
+
+  log "isolation applied (auto-release in ${TIMEOUT_SECONDS}s, pid $!)"
+}
+
+case "$COMMAND" in
+  add)
+    apply_isolation
+    ;;
+  delete)
+    cancel_pending_release
+    remove_isolation
+    log "isolation manually released"
+    ;;
+  *)
+    log "unrecognized command in payload: $INPUT_JSON"
+    ;;
+esac
+
+exit 0

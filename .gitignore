@@ -21,3 +21,6 @@ ddos-attacker/.last_ip_octet
 docs/
 *.pdf
 *.swp
+
+# insider-threat scenario — Ansible-generated SSH test keypair, never commit
+secrets/

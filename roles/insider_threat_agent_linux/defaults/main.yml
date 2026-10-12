@@ -1,0 +1,18 @@
+---
+insider_threat_accounts:
+  - { name: ubuntu,     uid: 21001, whitelist: false }
+  - { name: it.prlab,   uid: 21002, whitelist: true }
+  - { name: svc_backup, uid: 21003, whitelist: true }
+
+insider_threat_ssh_key_path: "{{ playbook_dir }}/secrets/insider_threat_test_key"
+
+insider_threat_isolate_timeout_seconds: 120
+
+# Whitelist for host-isolate.sh. 172.23.0.1 is the dmz-ubuntu_default
+# bridge gateway - confirmed via `docker network inspect` that this is the
+# SAME address the Docker host uses whether connecting in via Ansible or a
+# manual `docker exec`/`ssh` from the host (dmz-ubuntu does not publish
+# port 22 externally, so there is no separate "your laptop's IP" to
+# whitelist - everything reaching this container's sshd arrives from the
+# host's bridge-side address).
+insider_threat_mgmt_ip: 172.23.0.1

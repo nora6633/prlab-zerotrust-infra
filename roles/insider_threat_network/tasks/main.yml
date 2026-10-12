@@ -1,0 +1,60 @@
+---
+# Targets hosts: soc (local execution on the Docker host).
+#
+# dmz-ubuntu_default and ubuntu-lan_default are two separate, non-routed
+# docker bridge networks (confirmed: a cross-network connection attempt
+# just hangs in SYN_SENT/UNREPLIED, never completes a handshake) - this
+# role creates a small dedicated link network just for the scenario 3
+# lateral-movement step, and attaches BOTH existing containers to it
+# without recreating or restarting either one.
+#
+# dmz-ubuntu's attachment to this network is instead declared in its own
+# docker-compose.yaml (see the diff presented separately) - it is already
+# being recreated for the audit-log bind mount, so there is no reason to
+# ALSO attach it imperatively here; doing both would fight each other.
+# lan-host must never be recreated (freeipa/nextcloud/mailcow), so its
+# attachment is purely imperative via `docker network connect`, redone
+# idempotently by this role every run - it will NOT survive a
+# `docker compose down && up` on lan-host's own compose file, by design.
+#
+# ORDERING: this role MUST run (and the network must exist) BEFORE
+# `docker compose up -d` is ever run against dmz-ubuntu's own
+# docker-compose.yaml - that compose file declares scenario3-link as an
+# `external: true` network, so compose will refuse to start the container
+# at all if this role hasn't created it yet (fails with "network
+# scenario3-link declared as external, but could not be found").
+
+- name: Create the insider-threat link network (idempotent)
+  community.docker.docker_network:
+    name: "{{ insider_threat_link_network }}"
+    driver: bridge
+    ipam_config:
+      - subnet: "{{ insider_threat_link_subnet }}"
+    state: present
+  register: _insider_threat_network_result
+
+- name: Fail fast with a clear message if the link network didn't come up as expected
+  assert:
+    that:
+      - _insider_threat_network_result is not failed
+    fail_msg: >-
+      Failed to create/verify the {{ insider_threat_link_network }} docker
+      network ({{ insider_threat_link_subnet }}). dmz-ubuntu's
+      docker-compose.yaml depends on this network already existing
+      (declared as `external: true`) - do not proceed to
+      `docker compose up -d` on dmz-ubuntu until this is fixed.
+    success_msg: "{{ insider_threat_link_network }} ({{ insider_threat_link_subnet }}) is present."
+
+- name: Check whether lan-host is already attached to the link network
+  command: >
+    docker inspect lan
+    --format '{{ '{{' }} index .NetworkSettings.Networks "{{ insider_threat_link_network }}" {{ '}}' }}'
+  register: lan_link_check
+  changed_when: false
+  failed_when: false
+
+- name: Attach lan-host to the link network with a static IP (runtime only, no restart)
+  command: >
+    docker network connect --ip {{ insider_threat_lan_link_ip }}
+    {{ insider_threat_link_network }} lan
+  when: "'<nil>' in lan_link_check.stdout or lan_link_check.rc != 0"

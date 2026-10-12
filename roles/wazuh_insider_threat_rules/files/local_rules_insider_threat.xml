@@ -1,0 +1,167 @@
+<!-- Scenario 3: insider threat / high-risk suspicious behaviour.
+
+     Source of truth is Linux auditd, NOT Splunk/Palo Alto (those are the
+     original thesis' tooling, replaced here with Wazuh indexer queries +
+     Wazuh Active Response - see roles/shuffle/templates/wazuh_insider_threat_workflow.json.j2
+     and roles/insider_threat_agent_linux/files/active-response/host-isolate.sh).
+
+     auditd itself cannot run inside the dmz-ubuntu container (the kernel's
+     audit netlink control plane requires the caller to be in the init PID
+     namespace - confirmed by direct test, Docker-wide limitation, not a
+     capability/permission issue). auditd instead runs on the Docker HOST,
+     with a single execve rule scoped to the three test-account UIDs
+     (21001-21003, see roles/insider_threat_host_audit), and the host's
+     /var/log/audit is bind-mounted read-only into dmz-ubuntu where the
+     existing wazuh-agent reads it via <log_format>audit</log_format>.
+     Confirmed live: the kernel's d_path() resolves audit.exe/audit.cwd
+     relative to the *executing task's own mount namespace*, so these
+     fields correctly show the container-internal path (e.g.
+     "/usr/bin/whoami"), not a host-side overlay path, even though the
+     auditd daemon itself runs on the host.
+
+     Because the auditd rule can only filter by UID (not by in-container
+     path - see the role's rules template for why), it tags EVERY execve
+     from the test UIDs with ONE key ("insider_threat_exec"), including a
+     lot of PAM/session-startup noise from SSH login (systemd --user,
+     update-motd.d, systemctl, uname, run-parts, env, dash...). Rather than
+     maintain an exclude-list for that noise, each rule below does a
+     POSITIVE match on audit.exe/audit.command against the exact binary it
+     cares about, so noise simply falls through to the parent (80700,
+     level 0, no alert) instead of needing to be special-cased. -->
+<group name="scenario3,insider_threat,">
+
+  <!-- (1) Discovery: recon commands (T1033). whoami AND id both count -
+       sub-scenario B runs "whoami; id" back to back and expects two
+       separate recon-stage hits. -->
+  <rule id="100400" level="6">
+    <if_sid>80700</if_sid>
+    <field name="audit.key">insider_threat_exec</field>
+    <field name="audit.exe">^/usr/bin/whoami$|^/usr/bin/id$</field>
+    <description>Reconnaissance command executed by UID $(audit.auid): $(audit.exe)</description>
+    <mitre>
+      <id>T1033</id>
+    </mitre>
+    <group>soar_trigger,insider_threat,reconnaissance,</group>
+  </rule>
+
+  <!-- (1) Discovery: internal network scan via nmap (T1046). -->
+  <rule id="100402" level="8">
+    <if_sid>80700</if_sid>
+    <field name="audit.key">insider_threat_exec</field>
+    <field name="audit.exe">^/usr/bin/nmap$|^/usr/lib/nmap/nmap$</field>
+    <description>Internal network scanning tool executed: nmap by UID $(audit.auid)</description>
+    <mitre>
+      <id>T1046</id>
+    </mitre>
+    <group>soar_trigger,insider_threat,scanning,network_reconnaissance,</group>
+  </rule>
+
+  <!-- (4) C2: netcat executed, any destination (parent for 100403).
+       Matches both the "nc" shim and the real resolved binary
+       (nc -> /etc/alternatives/nc -> nc.openbsd on this image - confirmed
+       via readlink -f, audit.exe records the resolved target). -->
+  <rule id="100405" level="6">
+    <if_sid>80700</if_sid>
+    <field name="audit.key">insider_threat_exec</field>
+    <field name="audit.exe">^/usr/bin/nc$|^/bin/nc$|^/usr/bin/nc\.openbsd$|^/bin/nc\.openbsd$|^/usr/bin/ncat$</field>
+    <description>netcat executed by UID $(audit.auid): $(audit.exe)</description>
+    <mitre>
+      <id>T1095</id>
+    </mitre>
+    <group>soar_trigger,insider_threat,suspicious_tool,</group>
+  </rule>
+
+  <!-- (4) C2: netcat argv contains port 4444 -> possible Metasploit C2
+       (T1571). SYSCALL (has audit.key/auid) and EXECVE (has the argv,
+       audit.execve.aN) are two SEPARATE Wazuh events sharing the same
+       audit.id - confirmed via wazuh-logtest that a same-line <match> (the
+       original thesis' approach) never sees the port, since the port
+       never appears on the SYSCALL line. Correlates across the two events
+       via if_matched_sid + same_field audit.id instead (confirmed working
+       both positive - port 4444 - and negative - port 80 does not fire -
+       via wazuh-logtest). -->
+  <rule id="100403" level="10">
+    <if_sid>80700</if_sid>
+    <field name="audit.type">^EXECVE$</field>
+    <match>4444</match>
+    <if_matched_sid>100405</if_matched_sid>
+    <same_field>audit.id</same_field>
+    <description>Possible Metasploit C2: netcat to port 4444 by UID $(audit.auid)</description>
+    <mitre>
+      <id>T1571</id>
+      <id>T1095</id>
+    </mitre>
+    <group>insider_threat,c2_communication,high_severity,soar_trigger,</group>
+  </rule>
+
+  <!-- (2) Lateral movement: ssh client executed on the source host
+       (T1021.004). Fires on local execve regardless of whether the
+       remote login actually succeeds. -->
+  <rule id="100406" level="5">
+    <if_sid>80700</if_sid>
+    <field name="audit.key">insider_threat_exec</field>
+    <field name="audit.exe">^/usr/bin/ssh$</field>
+    <description>Lateral movement: ssh executed by UID $(audit.auid) on $(agent.name)</description>
+    <mitre>
+      <id>T1021.004</id>
+    </mitre>
+    <group>soar_trigger,attack_chain_step,lateral_movement,</group>
+  </rule>
+
+  <!-- (3) Collection: archive tool executed (T1005). -->
+  <rule id="100407" level="5">
+    <if_sid>80700</if_sid>
+    <field name="audit.key">insider_threat_exec</field>
+    <field name="audit.exe">^/usr/bin/tar$|^/bin/tar$</field>
+    <description>Collection: archive tool executed by UID $(audit.auid): $(audit.exe)</description>
+    <mitre>
+      <id>T1005</id>
+    </mitre>
+    <group>attack_chain_step,collection,soar_trigger,</group>
+  </rule>
+
+  <!-- (5) Exfiltration: curl transfer (T1048). -->
+  <rule id="100408" level="6">
+    <if_sid>80700</if_sid>
+    <field name="audit.key">insider_threat_exec</field>
+    <field name="audit.exe">^/usr/bin/curl$</field>
+    <description>Possible exfiltration: transfer tool executed by UID $(audit.auid): $(audit.exe)</description>
+    <mitre>
+      <id>T1048</id>
+    </mitre>
+    <group>attack_chain_step,exfiltration,soar_trigger,</group>
+  </rule>
+
+  <!-- Composite APT fast-path: 3 insider_threat-group events on the SAME
+       host AND the SAME auid within 120s -> immediate isolation.
+
+       NOTE which rules actually carry the "insider_threat" group tag:
+       100400, 100402, 100405, 100403 only. 100406/100407/100408 use
+       "attack_chain_step" instead, so ssh/tar/curl do NOT count toward
+       this threshold. Sub-scenario C's own sequence (whoami, nmap, ssh,
+       tar) only produces 2 insider_threat-tagged hits (whoami, nmap), so
+       it can never reach this rule on its own - confirmed by reading the
+       group tags on every rule above, not assumed.
+
+       same_field audit.auid (added on top of the original thesis' design,
+       which only had same_field agent.name) stops a different account's
+       events on the same host from being counted toward this chain -
+       confirmed via wazuh-logtest: an interleaved different-auid event is
+       correctly skipped. same_field agent.name could not be exercised via
+       wazuh-logtest directly (it has no real agent-forwarding context to
+       populate that field) - verify in Phase 1/2 against the real
+       agent-to-manager pipeline. -->
+  <rule id="100410" level="14" frequency="3" timeframe="120">
+    <if_matched_group>insider_threat</if_matched_group>
+    <same_field>agent.name</same_field>
+    <same_field>audit.auid</same_field>
+    <description>APT early reconnaissance: multiple insider-threat indicators by the same UID on $(agent.name) within 120s - immediate isolation required</description>
+    <mitre>
+      <id>T1078</id>
+      <id>T1033</id>
+      <id>T1046</id>
+    </mitre>
+    <group>apt,critical,auto_response,soar_trigger,</group>
+  </rule>
+
+</group>

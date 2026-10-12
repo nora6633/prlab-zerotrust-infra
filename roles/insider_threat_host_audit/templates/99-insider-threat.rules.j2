@@ -1,0 +1,26 @@
+## Managed by Ansible (roles/insider_threat_host_audit). Do not hand-edit -
+## changes will be overwritten on the next playbook run.
+##
+## auditd runs on the Docker HOST, not inside dmz-ubuntu - the kernel's
+## audit netlink control plane requires the caller to be in the init PID
+## namespace, which no container satisfies (confirmed by direct test: a
+## privileged container gets "Operation not permitted" on every netlink
+## control call even with CAP_AUDIT_CONTROL/CAP_AUDIT_WRITE present).
+##
+## Scoped to the three insider-threat test account UIDs only
+## ({{ insider_threat_test_uid_min }}-{{ insider_threat_test_uid_max }}).
+## Deliberately UID-only, no -w <path> / -F exe=<path>: auditctl resolves
+## those against the HOST's filesystem at rule-load time, but the commands
+## we care about only exist inside dmz-ubuntu's own mount namespace (a
+## different inode even for an identically-named host path, if one
+## happened to exist). The executable path IS still usable downstream,
+## because the kernel's d_path() records audit.exe/audit.cwd relative to
+## the *executing task's own* mount namespace - confirmed live, so Wazuh's
+## rules can safely match audit.exe even though this rule itself cannot.
+##
+## One shared key for all matched execve - command-level classification
+## (whoami vs nmap vs ssh vs ...) happens in the Wazuh rule layer via a
+## positive match on audit.exe/audit.command, not here, since per-command
+## auditd rules would all share the identical UID-only match condition
+## anyway (nothing here can distinguish by command).
+-a always,exit -F arch=b64 -S execve -F auid>={{ insider_threat_test_uid_min }} -F auid<={{ insider_threat_test_uid_max }} -k insider_threat_exec

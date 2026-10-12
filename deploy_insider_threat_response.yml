@@ -1,0 +1,36 @@
+---
+# Steps:
+#   1. site.yml + deploy_windows_dmz.yml / deploy_dmz_ubuntu_nginx.yml already applied
+#      (dmz-ubuntu and lan-host both have a registered Wazuh agent).
+#   2. ansible-playbook -i inventory/hosts.ini deploy_insider_threat_response.yml
+#   3. Re-run configure_integration.yml afterwards to wire up the Shuffle
+#      workflow + custom-shuffle.py routing (not yet written - Phase 1/2).
+#
+# The "network" tagged play attaches the dedicated scenario3-link bridge
+# (see roles/insider_threat_network) and, on dmz-ubuntu, depends on a
+# docker-compose change that recreates the container - both are gated on
+# explicit approval of a presented diff and are safe to --skip-tags network
+# until that happens. Everything else here is independently idempotent.
+
+- name: Configure insider-threat detection on Wazuh manager + host auditd
+  hosts: soc
+  become: true
+  gather_facts: true
+  roles:
+    - insider_threat_host_audit
+    - wazuh_insider_threat_rules
+
+- name: Attach scenario3 link network (lan-host side; dmz-ubuntu side is its own compose change)
+  hosts: soc
+  become: true
+  gather_facts: false
+  tags: [network]
+  roles:
+    - insider_threat_network
+
+- name: Deploy insider-threat test accounts + AR + packages on dmz-ubuntu
+  hosts: dmz-ubuntu
+  become: true
+  gather_facts: true
+  roles:
+    - insider_threat_agent_linux
