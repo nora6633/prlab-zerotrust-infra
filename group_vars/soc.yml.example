@@ -1,0 +1,73 @@
+---
+# Template for group_vars/soc.yml - copy this file to group_vars/soc.yml and
+# fill in real values. soc.yml itself is gitignored/skip-worktree and must
+# NEVER be committed. Every value below is a placeholder, not a working
+# default - do not deploy with this file as-is.
+
+# ── Shuffle ────────────────────────────────────────────────────────────────
+shuffle_admin_username: admin
+shuffle_admin_password: "CHANGE_ME"
+# API key used by Ansible and the Wazuh integration to authenticate with
+# Shuffle. Generate from the Shuffle UI (Admin -> API keys) after first boot.
+shuffle_default_apikey: "CHANGE_ME"
+# Stable IDs for the pre-built IRIS workflow - fill in after first import
+# (see configure_integration.yml), these are NOT guessable/default values.
+shuffle_workflow_id: "CHANGE_ME"
+shuffle_webhook_trigger_id: "CHANGE_ME"
+# Stable IDs for the DDoS auto-response workflow
+shuffle_ddos_workflow_id: "CHANGE_ME"
+shuffle_ddos_webhook_trigger_id: "CHANGE_ME"
+# Stable IDs for the USB-DLP auto-response workflow
+shuffle_usb_dlp_workflow_id: "CHANGE_ME"
+shuffle_usb_dlp_webhook_trigger_id: "CHANGE_ME"
+# Stable IDs for the insider-threat auto-response workflow (scenario 3)
+shuffle_insider_threat_workflow_id: "CHANGE_ME"
+shuffle_insider_threat_webhook_trigger_id: "CHANGE_ME"
+
+# ── Wazuh API (used by the DDoS/insider-threat AUTO_BLOCK paths to call
+#    PUT /active-response, and by insider-threat-test/run_attack.sh's
+#    --reset). Same credential the dashboard uses (wazuh.yml.j2).
+wazuh_api_user: "wazuh-wui"
+wazuh_api_password: "CHANGE_ME"
+
+# ── DMZ agent IDs (used to target the right agent for Active Response).
+#    These are assigned by Wazuh at agent registration time, NOT something
+#    you choose - after enrolling agents, check the real values with
+#    `agent_control -l` on the manager and fill them in here. They are not
+#    secrets, just environment-specific IDs.
+dmz_windows_agent_id: "CHANGE_ME"   # e.g. "006"
+dmz_ubuntu_agent_id: "CHANGE_ME"    # e.g. "007"
+
+# ── AbuseIPDB (scenario 2, N3) ───────────────────────────────────────────
+# Get a free key at https://www.abuseipdb.com/account/api
+abuseipdb_api_key: "CHANGE_ME"
+
+# ── Wazuh indexer (N4 history query / insider-threat progression lookup) ──
+wazuh_indexer_url: "https://{{ wazuh_server_ip }}:9200"
+wazuh_indexer_user: "admin"
+wazuh_indexer_password: "CHANGE_ME"
+
+# ── SOC notification (NOTIFY_SOC email) ──────────────────────────────────
+soc_notify_email: "soc@example.lab"
+
+# ── DFIR-IRIS ──────────────────────────────────────────────────────────────
+iris_version: "v2.4.18"
+iris_admin_password: "CHANGE_ME"
+# Set this AFTER first running configure_integration.yml and generating an
+# API key from the IRIS UI (Advanced -> API keys) - used by Shuffle to call
+# the IRIS API.
+iris_adm_api_key: "CHANGE_ME"
+iris_db_password: "CHANGE_ME"
+iris_rabbitmq_user: iris
+iris_rabbitmq_password: "CHANGE_ME"
+iris_secret_key: "CHANGE_ME_AT_LEAST_32_CHARS"
+
+# ── Wazuh integration ──────────────────────────────────────────────────────
+wazuh_alert_min_level: 7
+
+# Host-side path of the file that the manager container's entrypoint copies
+# into /var/ossec/etc/ossec.conf on every restart. Modifications to
+# /var/ossec/etc/ossec.conf INSIDE the container do NOT survive restarts -
+# always inject into this path instead. Adjust {{ deploy_base_dir }} to
+# match wherever you cloned/deployed this repo on the Docker host.
+wazuh_manager_host_conf: "{{ deploy_base_dir }}/wazuh/wazuh-docker/single-node/config/wazuh_cluster/wazuh_manager.conf"
