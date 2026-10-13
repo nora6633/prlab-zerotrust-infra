@@ -8,7 +8,15 @@
 2. **`wazuh_server_ip` 必須是所有 agent（dmz-ubuntu / dmz-windows / lan-host）都能連到的位址。** 這個值是從 `inventory/hosts.ini` 的 `soc-host` `ansible_host` 自動推導（`group_vars/all.yml`），不需要另外設定，但要確認 DMZ/LAN 側實際連得到這個 IP 的 1514/1515（agent 通訊）、55000（API）、5001（Shuffle）、9200（indexer）。**之後要換這個 IP 的話請見本檔最後「變更 `wazuh_server_ip` 的影響範圍」。**
 3. **Wazuh 版本固定在 4.9.2**（`group_vars/all.yml` 的 `wazuh_version`）。AR 派送機制與 `wazuh-execd` payload 格式的細節（見 DEVIATIONS #24：execd 頂層 `command` 欄位恆為 `"add"`，真正意圖在 `parameters.extra_args`）是針對這個版本實測確認的——換 Wazuh 版本後要重新驗證 `host-isolate.sh` 的解析邏輯還成立。
 4. **跑之前先確認 Shuffle 的 `workflow` OpenSearch index alias 沒有分裂。** DEVIATIONS #16 記錄過一次 `workflow` alias 分裂成 `workflow-000001`/`workflow-000002` 兩個底層 index，導致所有 webhook（含情境一二）完全失效。健康檢查指令見本檔最後「Shuffle alias 健康檢查」一節。
-5. **`group_vars/soc.yml` / `inventory/hosts.ini` 已從對應的 `.example` 複製並填好真實值**（這兩個檔案本身不會進版控）。需要填的變數：
+5. **`group_vars/soc.yml` / `inventory/hosts.ini` 已從對應的 `.example` 複製並填好真實值。**
+
+   ⚠️ **這兩個檔案其實是被 git 追蹤的**（不是 gitignore），clone 下來就已經有內容——目前是用 `git update-index --skip-worktree` 讓本機對它們的修改不會出現在 `git status`/`git diff`/`git commit` 裡，但這**不等於**沒進版控，git 歷史裡原本就留著曾經提交過的內容。**在你用自己的真實值蓋掉這兩個檔案之前，先執行**：
+   ```
+   git update-index --skip-worktree group_vars/soc.yml inventory/hosts.ini
+   ```
+   （如果 clone 下來的副本還沒被標記成 skip-worktree，上面這行要先做，否則你填入的真實值會被 git 當成一般修改，一個 `git add -A` 或 `git commit -a` 就會把你的憑證提交進去。）這只是暫時的緩解措施，比較正確的長期做法是 repo 擁有者把這兩個檔案改成 `git rm --cached` 移出版控、加進 `.gitignore`，但那需要處理既有 git 歷史裡已經提交過的內容，由 repo 擁有者決定要不要做、怎麼做。
+
+   需要填的變數：
    - `inventory/hosts.ini.example` → `hosts.ini`：各主機的 `ansible_host`/`ansible_user`（dmz-windows 還需要 `ansible_password`）
    - `group_vars/soc.yml.example` → `soc.yml`：`wazuh_api_user`/`wazuh_api_password`、`wazuh_indexer_user`/`wazuh_indexer_password`、`shuffle_default_apikey`、`iris_adm_api_key`、`dmz_ubuntu_agent_id`（這個要等 agent 註冊後用 `agent_control -l` 查到才能填）、各 workflow/webhook trigger id（要等對應 playbook 第一次 import 後才知道）
    - `group_vars/all.yml`（這個會進版控，不用複製，但情境三特有的這幾個變數可能要依環境調整）：`insider_threat_accounts`（測試帳號與 UID，whitelist 標記）、`insider_threat_v5_force_off_hours`（預設 `false`，平時維持 `false`，只在驗收/測試時用 `set_force_off_hours.sh` 暫時切換，見下方）
