@@ -1,0 +1,186 @@
+---
+# Scenario-3-only Shuffle/Wazuh integration wiring. Deliberately SEPARATE
+# from configure_integration.yml: that playbook re-POSTs all three existing
+# workflows (IRIS/DDoS/USB-DLP) unconditionally on every run, and Shuffle's
+# import API creates a new duplicate each time rather than updating in
+# place (confirmed live: 6-7 duplicates already accumulated per workflow
+# name, 86 orphaned hook documents in the "hooks" OpenSearch index). This
+# playbook does not touch any of that - it looks up the CURRENTLY ACTIVE
+# IRIS/DDoS/USB-DLP trigger IDs (same "newest by created" selection
+# custom-shuffle.py's actual deployed behavior already depends on -
+# verified stable across repeated calls and cross-checked against
+# `created` timestamps, not just list position) and only imports/registers
+# the new insider-threat workflow.
+#
+# Known separate issue (not fixed here, see the deviation list): the
+# existing IRIS/DDoS/USB-DLP workflows' own internal HTTP action nodes
+# (wazuh_auth, wazuh_ar_block_*, wazuh_history, IRIS alert/case endpoints)
+# have the stale 192.168.5.15 IP baked into their stored JSON from import
+# time - re-rendering custom-shuffle.py here fixes the FORWARDING layer's
+# address, not those workflows' own internal node URLs. AUTO_BLOCK for
+# scenario 1/2 is likely non-functional until those three workflows are
+# re-imported with the current wazuh_server_ip - tracked separately, not
+# in scope for this playbook.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini configure_insider_threat_integration.yml
+
+- name: Configure insider-threat Shuffle workflow + custom-shuffle routing (scenario 3 only)
+  hosts: soc
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Ensure Shuffle backend is reachable
+      uri:
+        url: "http://{{ wazuh_server_ip }}:5001/api/v1/health"
+        method: GET
+        status_code: 200
+      register: shuffle_health
+      until: shuffle_health.status == 200
+      retries: 12
+      delay: 5
+
+    - name: Fetch current workflow list once
+      shell: |
+        curl -ks -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
+          "http://{{ wazuh_server_ip }}:5001/api/v1/workflows"
+      register: shuffle_workflows_raw
+      changed_when: false
+
+    # ── Look up scenario 1/2's CURRENTLY ACTIVE trigger IDs — no import ──
+    - name: Resolve currently-active IRIS/DDoS/USB-DLP trigger IDs (newest by created, no re-import)
+      set_fact:
+        shuffle_iris_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Alert to DFIR-IRIS Case') | sort(attribute='created', reverse=true) | first).triggers[0].id }}"
+        shuffle_ddos_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | sort(attribute='created', reverse=true) | first).triggers[0].id }}"
+        shuffle_usb_dlp_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh USB-DLP Auto-Response') | sort(attribute='created', reverse=true) | first).triggers[0].id }}"
+
+    - name: Show resolved scenario 1/2 trigger IDs (unchanged, just looked up)
+      debug:
+        msg:
+          - "IRIS webhook trigger (existing, reused): {{ shuffle_iris_actual_trig }}"
+          - "DDoS webhook trigger (existing, reused): {{ shuffle_ddos_actual_trig }}"
+          - "USB-DLP webhook trigger (existing, reused): {{ shuffle_usb_dlp_actual_trig }}"
+
+    # ── Insider-threat: import only if a workflow with this name doesn't already exist ──
+    - name: Check whether the insider-threat workflow already exists
+      set_fact:
+        insider_threat_existing: "{{ shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Insider-Threat Auto-Response') | list }}"
+
+    - name: Build UID_MAP / WHITELIST facts for the insider-threat scorer from insider_threat_accounts
+      set_fact:
+        insider_threat_uid_map_json: "{{ insider_threat_accounts | items2dict(key_name='uid', value_name='name') | to_json }}"
+        insider_threat_whitelist_json: "{{ insider_threat_accounts | selectattr('whitelist') | map(attribute='name') | list | to_json }}"
+      when: insider_threat_existing | length == 0
+
+    - name: Render insider-threat Shuffle node source files (Jinja - UID_MAP/WHITELIST substitution)
+      set_fact:
+        insider_threat_preprocess_code: "{{ lookup('template', 'roles/shuffle/files/insider_threat_preprocess.py.j2') }}"
+        insider_threat_score_code: "{{ lookup('template', 'roles/shuffle/files/insider_threat_score.py.j2') }}"
+        insider_threat_progression_code: "{{ lookup('file', 'roles/shuffle/files/insider_threat_progression.py') }}"
+      when: insider_threat_existing | length == 0
+
+    - name: Template insider-threat workflow JSON onto host (with embedded Python node sources)
+      template:
+        src: roles/shuffle/templates/wazuh_insider_threat_workflow.json.j2
+        dest: "{{ deploy_base_dir }}/shuffle/wazuh_insider_threat_workflow.json"
+        mode: '0644'
+      when: insider_threat_existing | length == 0
+
+    - name: Import insider-threat workflow into Shuffle via API (only when it didn't already exist)
+      shell: |
+        curl -ks -o /tmp/insider_threat_import.out -w "%{http_code}" -X POST \
+          "http://{{ wazuh_server_ip }}:5001/api/v1/workflows" \
+          -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
+          -H "Content-Type: application/json" \
+          --data @{{ deploy_base_dir }}/shuffle/wazuh_insider_threat_workflow.json
+      register: insider_threat_workflow_import
+      when: insider_threat_existing | length == 0
+      changed_when: insider_threat_workflow_import.stdout in ["200", "201"]
+      failed_when: insider_threat_workflow_import.stdout not in ["200", "201"]
+
+    - name: Re-fetch workflow list if we just imported (to pick up the new entry)
+      shell: |
+        curl -ks -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
+          "http://{{ wazuh_server_ip }}:5001/api/v1/workflows"
+      register: shuffle_workflows_raw_2
+      when: insider_threat_existing | length == 0
+      changed_when: false
+
+    - name: Resolve the insider-threat trigger ID (freshly imported, or the one already found)
+      set_fact:
+        shuffle_insider_threat_actual_trig: >-
+          {{
+            ((shuffle_workflows_raw_2.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Insider-Threat Auto-Response') | sort(attribute='created', reverse=true) | first).triggers[0].id)
+            if insider_threat_existing | length == 0
+            else (insider_threat_existing | sort(attribute='created', reverse=true) | first).triggers[0].id
+          }}
+        shuffle_insider_threat_actual_wf: >-
+          {{
+            ((shuffle_workflows_raw_2.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Insider-Threat Auto-Response') | sort(attribute='created', reverse=true) | first).id)
+            if insider_threat_existing | length == 0
+            else (insider_threat_existing | sort(attribute='created', reverse=true) | first).id
+          }}
+
+    - debug:
+        msg:
+          - "Insider-threat workflow was {{ 'imported fresh' if insider_threat_existing | length == 0 else 'already present, reused' }}"
+          - "Insider-threat workflow id: {{ shuffle_insider_threat_actual_wf }}"
+          - "Insider-threat webhook trigger: {{ shuffle_insider_threat_actual_trig }}"
+
+    # start is load-bearing (see configure_integration.yml's comment on the
+    # same thing) - this is the one node that always actually needs its
+    # hook (re-)activated, since reusing an existing workflow still needs a
+    # hook if one was never registered, and re-running this playbook must
+    # stay idempotent either way.
+    - name: Activate the insider-threat webhook hook (idempotent)
+      shell: |
+        curl -ks -X POST -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
+          -H "Content-Type: application/json" \
+          -d '{"id":"{{ shuffle_insider_threat_actual_trig }}","name":"Insider Threat Webhook","info":{"name":"Insider Threat Webhook"},"type":"webhook","workflows":["{{ shuffle_insider_threat_actual_wf }}"],"status":"running","workflow":"{{ shuffle_insider_threat_actual_wf }}","start":"alert_preprocessing"}' \
+          "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/new"
+      changed_when: false
+
+    # ── Re-render custom-shuffle.py: scenario 1/2 IDs reused as-is, only the insider-threat one is new ──
+    - name: Template custom-shuffle integration script (scenario 1/2 IDs unchanged, insider-threat added)
+      template:
+        src: roles/wazuh_server/templates/custom-shuffle.py.j2
+        dest: /tmp/custom-shuffle
+        mode: '0755'
+      vars:
+        shuffle_webhook_trigger_id: "{{ shuffle_iris_actual_trig }}"
+        shuffle_ddos_webhook_trigger_id: "{{ shuffle_ddos_actual_trig }}"
+        shuffle_usb_dlp_webhook_trigger_id: "{{ shuffle_usb_dlp_actual_trig }}"
+        shuffle_insider_threat_webhook_trigger_id: "{{ shuffle_insider_threat_actual_trig }}"
+
+    - name: Copy integration script into single-node-wazuh.manager-1 container
+      command: docker cp /tmp/custom-shuffle single-node-wazuh.manager-1:/var/ossec/integrations/custom-shuffle
+
+    - name: Set ownership and permissions on integration script
+      command: >
+        docker exec single-node-wazuh.manager-1 sh -c
+        "chown root:wazuh /var/ossec/integrations/custom-shuffle &&
+         chmod 750 /var/ossec/integrations/custom-shuffle"
+
+    - name: Restart single-node-wazuh.manager-1 to apply the refreshed integration script
+      command: docker restart single-node-wazuh.manager-1
+
+    - name: Wait for Wazuh manager API to come back
+      uri:
+        url: "https://{{ wazuh_server_ip }}:55000/"
+        method: GET
+        validate_certs: false
+        status_code: [200, 401]
+      register: api_check
+      until: api_check.status in [200, 401]
+      retries: 30
+      delay: 10
+
+    - name: Print summary
+      debug:
+        msg:
+          - "Insider-threat workflow id  : {{ shuffle_insider_threat_actual_wf }}"
+          - "Insider-threat trigger id   : {{ shuffle_insider_threat_actual_trig }}"
+          - "IRIS trigger (reused)       : {{ shuffle_iris_actual_trig }}"
+          - "DDoS trigger (reused)       : {{ shuffle_ddos_actual_trig }}"
+          - "USB-DLP trigger (reused)    : {{ shuffle_usb_dlp_actual_trig }}"
