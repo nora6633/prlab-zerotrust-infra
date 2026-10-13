@@ -2,6 +2,15 @@
 
 對應雛型手冊「情境三 高風險可疑行為」章節、報告書「系統測試與效能評估」章節 4.1~4.3 的子情境 A/B/C，加上本輪驗收新增的補充子情境 D。完整的設計偏差與已知限制請見 [`DEVIATIONS.md`](./DEVIATIONS.md)，本檔只處理「怎麼跑」。
 
+**先讀過 repo 根目錄的 [`README.md`](../README.md)**——那份才是整個 lab（Wazuh/Shuffle/IRIS 等基礎設施）的部署入口，本檔完全假設 `site.yml` 等基礎部署已經跑過。特別是根目錄 README 的「Single machine simulating 3 hosts vs. 3 real hosts」一節（單機 Docker 模擬 3 台主機時 `dmz-ubuntu`/`ubuntu-lan` 容器要手動建立，沒有任何 Ansible role 會自動建）跟「Change secrets」一節（`soc.yml` 全部變數的分類、`wazuh_api_password` 不能亂改的原因）。
+
+## 環境假設（明確列出，不要假設）
+
+- **作業系統：Ubuntu 24.04**（根目錄 README 的 Prerequisites 寫的目標版本；本檔沒有獨立測試過其他版本）。
+- **Docker host 本身必須是真實機器或 VM，不能是巢狀容器**（見下方第1點，auditd 需要 kernel 權限）。
+- **`wazuh_server_ip` 一定要改成你自己環境的位址**，不能照抄本 repo 任何既有的值——這個值是從 `inventory/hosts.ini` 推導出來的，不是寫死的常數。
+- 單機模擬 3 台主機的拓樸細節、`soc.yml` 變數意義，請見根目錄 README，本檔不重複。
+
 ## 前置條件
 
 1. **Docker host 本身必須是真實機器或 VM，不能是巢狀容器。** `insider_threat_host_audit` role 會自動在 `soc` 主機（inventory 裡 `ansible_connection=local` 的那台）安裝並設定 auditd，但 auditd 需要 kernel audit netlink 權限，容器內無法取得（見 DEVIATIONS #3）——這也是為什麼 dmz-ubuntu 本身是容器、auditd 卻裝在 Docker host 上，再把 `/var/log/audit` 唯讀 bind mount 進容器的原因。
@@ -18,7 +27,7 @@
 
    需要填的變數：
    - `inventory/hosts.ini.example` → `hosts.ini`：各主機的 `ansible_host`/`ansible_user`（dmz-windows 還需要 `ansible_password`）
-   - `group_vars/soc.yml.example` → `soc.yml`：`wazuh_api_user`/`wazuh_api_password`、`wazuh_indexer_user`/`wazuh_indexer_password`、`shuffle_default_apikey`、`iris_adm_api_key`、`dmz_ubuntu_agent_id`（這個要等 agent 註冊後用 `agent_control -l` 查到才能填）、各 workflow/webhook trigger id（要等對應 playbook 第一次 import 後才知道）
+   - `group_vars/soc.yml.example` → `soc.yml`：**完整的 28 個欄位分類（哪些必填、哪些可以留佔位值、哪些是部署後才知道）請見根目錄 README 的「Change secrets」一節，不在這裡重複**。情境三直接會用到的是 `wazuh_api_user`/`wazuh_api_password`（⚠️ **這兩個不要改，原因見根目錄README——Wazuh manager 的 `wazuh-wui` 密碼是寫死在 `wazuh.yml.j2` 裡的官方預設值，改了 soc.yml 這裡不會讓 manager 真的換密碼，AR 會認證失敗**）、`wazuh_indexer_user`/`wazuh_indexer_password`、`dmz_ubuntu_agent_id`（agent 註冊後用 `agent_control -l` 查）、`shuffle_insider_threat_workflow_id`/`_webhook_trigger_id`（情境三 workflow 第一次 import 後才知道）
    - `group_vars/all.yml`（這個會進版控，不用複製，但情境三特有的這幾個變數可能要依環境調整）：`insider_threat_accounts`（測試帳號與 UID，whitelist 標記）、`insider_threat_v5_force_off_hours`（預設 `false`，平時維持 `false`，只在驗收/測試時用 `set_force_off_hours.sh` 暫時切換，見下方）
 6. **`secrets/insider_threat_test_key` SSH keypair 已產生**，公鑰已經透過 `insider_threat_agent_linux` role 部署到 dmz-ubuntu 的 `ubuntu`/`it.prlab` 帳號（`run_attack.sh` 用這把 key 以各帳號身份登入下指令）。
 

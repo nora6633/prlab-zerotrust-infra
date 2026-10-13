@@ -127,6 +127,24 @@ Set-Item WSMan:\localhost\Service\Auth\Basic $true
 Set-Item WSMan:\localhost\Service\AllowUnencrypted $true   # lab only
 ```
 
+### Single machine simulating 3 hosts vs. 3 real hosts
+
+The Architecture diagram above describes 3 logically separate hosts (External/SOC/LAN). Nothing about the roles themselves requires that — `site.yml` just targets whatever `inventory/hosts.ini` groups resolve to. In practice this lab is commonly run **on a single physical machine**, with each "host" actually being a separate Docker container/bridge network on that one machine, and `inventory/hosts.ini`'s `ansible_host` values pointing at those containers' bridge IPs rather than separate real machines. If that's your setup:
+
+- The `soc` group's `ansible_host` is the Docker host's own address (same machine Ansible runs on), with `ansible_connection=local`.
+- `external`/`lan` point at container IPs on their own bridge networks, not separate VMs.
+- **`dmz-ubuntu/docker-compose.yaml` and `ubuntu-lan/docker-compose.yaml` are not deployed by any Ansible role in this repo** — nothing here runs `docker compose up` for them. If you're using these containers as stand-ins for the external/LAN hosts, you have to build and start them yourself before `site.yml`'s `external`/`lan` plays can even SSH in:
+  ```bash
+  # dmz-ubuntu declares its own network as external:true - create it first
+  docker network create dmz-ubuntu_default
+  cd dmz-ubuntu && docker compose build && docker compose up -d
+
+  # ubuntu-lan's default network is NOT external - compose creates it itself
+  cd ubuntu-lan && docker compose build && docker compose up -d
+  ```
+  Confirm the subnet/IP `docker network create` picks matches what `inventory/hosts.ini` expects to SSH into (`docker network inspect dmz-ubuntu_default` after creation). This whole bootstrapping step is undocumented elsewhere in this repo - if you know of an existing automated path for it, this note should be corrected.
+- If a scenario's own setup (e.g. `insider-threat-test/`) requires host-level `auditd`, that specifically needs a real machine or VM for the `soc` host - it cannot run inside a container (no access to the kernel audit netlink socket). See `insider-threat-test/README.md`'s prerequisites.
+
 ---
 
 ## Usage
@@ -157,18 +175,50 @@ All service configs (Wazuh agent → manager IP, Shuffle webhook URLs, etc.) are
 
 ### 2. Change secrets
 
-**Required before deploy** — edit `group_vars/soc.yml`:
+**`group_vars/soc.yml` is not gitignored - it's a tracked file with real values currently committed to history (clean that up / rotate those values before treating this repo as shareable).** Copy `group_vars/soc.yml.example` to `group_vars/soc.yml` and `inventory/hosts.ini.example` to `inventory/hosts.ini` for a fresh checkout, and run `git update-index --skip-worktree group_vars/soc.yml inventory/hosts.ini` before filling in your own values so they don't get committed.
+
+None of `soc.yml`'s ~28 variables have an Ansible-level default (no `defaults/main.yml`, no `| default(...)` anywhere) - every one of them must have *some* string or template rendering fails outright. Whether that string needs to be a real, working value, or whether the `.example` placeholder is fine to leave as-is, differs per variable:
+
+**Choose a real value before first deploy - the respective container adopts it as its actual credential at boot** (confirmed in `roles/shuffle/templates/docker-compose.yml.j2` / `roles/dfir_iris/templates/docker-compose.yml.j2` - these are plain container env vars, nothing generates them after the fact and writes them back):
 
 | Variable | Description |
 |---|---|
+| `shuffle_admin_username` / `shuffle_admin_password` | Shuffle UI login |
 | `shuffle_default_apikey` | Shuffle API key (min 36 chars) |
 | `iris_adm_api_key` | DFIR-IRIS admin API key (min 36 chars); embedded into the Shuffle workflow so Shuffle can call the IRIS API |
 | `iris_admin_password` | DFIR-IRIS web UI password |
 | `iris_secret_key` | Flask secret key (min 32 chars) |
+| `iris_db_password`, `iris_rabbitmq_user` / `iris_rabbitmq_password` | IRIS's own Postgres/RabbitMQ credentials |
+
+⚠️ **`wazuh_api_user` / `wazuh_api_password` are the one pair that looks like the above but ISN'T - do not change these from the `.example` defaults.** `roles/wazuh_server/templates/wazuh.yml.j2` hardcodes the Wazuh dashboard's `wazuh-wui` API credential as a literal string (it's Wazuh's own upstream `wazuh-docker` single-node default, cloned verbatim by `roles/wazuh_server/tasks/main.yml` - nothing in this repo sets it from `soc.yml`). But the DDoS/USB-DLP/insider-threat Shuffle workflows *do* build their Basic Auth header for calling the Wazuh API from `soc.yml`'s `wazuh_api_user`/`wazuh_api_password`. If you "secure" these per the usual instinct, every Active Response dispatch in those three workflows silently starts failing auth against the real manager, because nothing changed the manager's actual password to match. Leave these as the `.example` values. The same is suspected for `wazuh_indexer_user`/`wazuh_indexer_password` (same lack of any template that sets them from `soc.yml`), but that one isn't confirmed by a found hardcoded-template the way the API password is - treat it the same way (leave as `.example`) until proven otherwise.
+
+**Fine to leave as the `.example` placeholder, no known functional impact either way:**
+
+| Variable | Why |
+|---|---|
+| `iris_version` | Already a real, working image tag |
+| `wazuh_alert_min_level` | Numeric threshold; the `.example` default (7) is what this repo's own rule design assumes |
+| `wazuh_manager_host_conf` | Path template, correct as long as `deploy_base_dir` matches your install |
+| `soc_notify_email` | **Dead variable - grepped the whole repo, nothing reads it.** Originally meant for a NOTIFY_SOC email step that was never wired up. |
+
+**Scenario-specific** (only matters if you're deploying that particular add-on scenario - see each scenario's own setup notes):
+
+| Variable | Scenario |
+|---|---|
+| `abuseipdb_api_key`, `shuffle_ddos_workflow_id` / `shuffle_ddos_webhook_trigger_id` | DDoS |
+| `shuffle_usb_dlp_workflow_id` / `shuffle_usb_dlp_webhook_trigger_id` | USB-DLP |
+| `shuffle_insider_threat_workflow_id` / `shuffle_insider_threat_webhook_trigger_id` | Insider-threat (`insider-threat-test/`) |
+| `dmz_windows_agent_id` | DDoS + USB-DLP (Windows AR target) |
+| `dmz_ubuntu_agent_id` | DDoS + Insider-threat (Linux AR target) |
+| `wazuh_indexer_url`/`user`/`password` | DDoS + Insider-threat only (USB-DLP uses a Shuffle cache instead of querying the indexer) |
+
+**Genuinely only knowable after a first deploy** (Shuffle re-generates UUIDs on import; agent IDs are assigned at registration time - leave the `.example` placeholder for the very first run, then fill in for real): `shuffle_workflow_id`/`shuffle_webhook_trigger_id` and all the other `shuffle_*_workflow_id`/`*_webhook_trigger_id` pairs, `dmz_windows_agent_id`, `dmz_ubuntu_agent_id`.
 
 Also review `group_vars/lan.yml` for FreeIPA, Nextcloud, and Mailcow passwords.
 
 Optionally change the domain (default `example.lab`) in `group_vars/all.yml`.
+
+> ⚠️ **Do not run `site.yml` against a machine that already has a working deployment on it using a *different* `soc.yml` than what's currently live.** `docker compose up -d` (used by every service role here) recreates any container whose rendered config changed - if your `soc.yml` differs from what the running containers were last deployed with, this will restart Wazuh/Shuffle/IRIS etc. with new credentials that may not match what's already inside their databases/volumes. This hasn't been tested end-to-end in this repo (no `--force-recreate` or `-v` flags are used, so it shouldn't delete volumes outright) - treat this as a reasoned risk from reading the roles, not a confirmed-safe-or-unsafe operation either way.
 
 ### 3. Deploy all services
 
