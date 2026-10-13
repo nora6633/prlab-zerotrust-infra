@@ -1,8 +1,8 @@
 ---
-insider_threat_accounts:
-  - { name: ubuntu,     uid: 21001, whitelist: false }
-  - { name: it.prlab,   uid: 21002, whitelist: true }
-  - { name: svc_backup, uid: 21003, whitelist: true }
+# insider_threat_accounts moved to group_vars/all.yml - configure_insider_threat_integration.yml
+# (a separate play, no role defaults in scope) also needs it to build
+# UID_MAP/WHITELIST for the Shuffle scorer, so it can't live in this role's
+# own defaults/ anymore.
 
 insider_threat_ssh_key_path: "{{ playbook_dir }}/secrets/insider_threat_test_key"
 

@@ -4,15 +4,49 @@
 # - no <rules_id>/<level> is bound to this command on the manager side, so
 # it never fires automatically off an alert match.
 #
+# CORRECTION #1 (see deviation list): an early version spliced
+# remove_isolation()'s *source text* via `$(declare -f remove_isolation)`
+# into a brand-new `bash -c "..."` subprocess, which does NOT inherit the
+# parent shell's variables - CHAIN expanded to an empty string there, so
+# every `iptables -D/-F/-X ""` silently failed and the chain was never
+# actually removed despite the log claiming success. Fixed by re-invoking
+# this same script file (`--release`) instead of splicing function text -
+# a fresh process that re-reads all its own variables from the top.
+#
+# CORRECTION #2 (see deviation list): `systemd-run --on-active=N` was then
+# tried as the primary timer, to dodge setsid's cgroup-kill risk (below).
+# Confirmed via live testing (direct systemd-run calls against this exact
+# container, writing marker files/log lines to /tmp, /root, /var/run, and
+# this very active-responses.log) that systemd reports the transient
+# unit's ExecStart as "status=0/SUCCESS", yet the command's filesystem
+# side effects never materialize anywhere visible (not in the container,
+# not on the Docker host) - the mechanism is unreliable in this
+# environment for reasons not further root-caused (out of scope per
+# operator instruction). Every "auto-released (verified)" log line seen
+# under that design was actually produced by the check_expired_deadline
+# backstop opportunistically firing during some UNRELATED later AR
+# invocation, never by the timer itself. Reverted to a `setsid` sleeper
+# (back to CORRECTION #1's --release re-invocation design) for precise
+# timing, with a Wazuh command wodle as a second, independent, 30s-interval
+# backstop specifically to cover the case the sleeper itself dies (e.g.
+# wazuh-agent.service restarting - setsid detaches the *session* but not
+# the *cgroup*, so a service restart with KillMode=control-group can still
+# reap it). Every release this script performs now logs which of the three
+# paths (timer / wodle / backstop) actually did it.
+#
 # wazuh-execd sends exactly one line of JSON on stdin and does NOT reliably
 # close the pipe afterwards - reading to EOF here will hang forever (same
 # upstream wazuh-execd behaviour as ip-limit.sh / block-usb-write.ps1).
-# `read -r` reads one line and returns; never use `cat`/`$(</dev/stdin)` here.
-read -r INPUT_JSON
+# `read -r` reads one line and returns; never use `cat`/`$(</dev/stdin)`
+# here. Neither the --release nor the --check-expiry re-invocation paths
+# read stdin at all (they aren't real AR dispatches), so this constraint
+# doesn't apply to them.
 
+SCRIPT_PATH="/var/ossec/active-response/bin/host-isolate.sh"
 LOG=/var/ossec/logs/active-responses.log
 CHAIN=WAZUH_ISOLATE
-PIDFILE=/var/run/host-isolate-release.pid
+DEADLINE_FILE=/var/run/host-isolate-deadline
+SLEEPER_PID_FILE=/var/run/host-isolate-sleeper.pid
 WAZUH_SERVER_IP="{{ wazuh_server_ip }}"
 MGMT_IP="{{ insider_threat_mgmt_ip }}"
 TIMEOUT_SECONDS="{{ insider_threat_isolate_timeout_seconds }}"
@@ -21,32 +55,68 @@ log() {
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) host-isolate.sh: $*" >> "$LOG"
 }
 
-COMMAND=$(echo "$INPUT_JSON" | grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]+)"$/\1/')
-
-# Kills any pending auto-release timer without erroring if none exists -
-# called on both add (reset, don't stack a second timer) and delete
-# (cancel it, the isolation is being lifted right now anyway).
-cancel_pending_release() {
-  if [ -f "$PIDFILE" ]; then
-    old_pid=$(cat "$PIDFILE" 2>/dev/null)
-    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-      kill "$old_pid" 2>/dev/null
-      log "cancelled pending auto-release timer (pid $old_pid)"
-    fi
-    rm -f "$PIDFILE"
-  fi
-}
-
+# Idempotent removal attempt - safe to call even if nothing is currently
+# isolated (iptables -D/-F/-X on a non-existent rule/chain errors "Bad
+# rule"/"No chain", an EXPECTED no-op here, not a real failure - that's
+# why these specific probe-style attempts stay suppressed; the actual
+# pass/fail determination happens in verify_released(), which does NOT
+# suppress anything.
 remove_isolation() {
-  # Idempotent: safe to call even if nothing is currently isolated.
   iptables -D INPUT  -j "$CHAIN" 2>/dev/null
   iptables -D OUTPUT -j "$CHAIN" 2>/dev/null
   iptables -F "$CHAIN" 2>/dev/null
   iptables -X "$CHAIN" 2>/dev/null
 }
 
+# Ground truth check, independent of remove_isolation()'s own exit codes:
+# confirms the chain is actually gone AND no longer referenced by
+# INPUT/OUTPUT. Returns 0 only if genuinely clean.
+verify_released() {
+  if iptables -L "$CHAIN" -n >/dev/null 2>&1; then
+    return 1
+  fi
+  if iptables -C INPUT -j "$CHAIN" >/dev/null 2>&1; then
+    return 1
+  fi
+  if iptables -C OUTPUT -j "$CHAIN" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+# Best-effort kill of a still-running setsid sleeper from a PRIOR
+# isolation (e.g. re-triggering "add" while already isolated, or a fresh
+# isolation starting before the old one's timer expired). Not load-bearing
+# for correctness - apply_isolation()'s token check in the sleeper's own
+# --release call independently guarantees a stale sleeper can never
+# release a newer isolation - this just avoids leaving an idle `sleep N`
+# process around for the old window's remaining duration.
+kill_stale_sleeper() {
+  if [ -f "$SLEEPER_PID_FILE" ]; then
+    local old_pid
+    old_pid=$(cat "$SLEEPER_PID_FILE" 2>/dev/null)
+    [ -n "$old_pid" ] && kill "$old_pid" 2>/dev/null
+    rm -f "$SLEEPER_PID_FILE"
+  fi
+}
+
+do_release() {
+  local source="$1"
+  kill_stale_sleeper
+  remove_isolation
+  if verify_released; then
+    log "auto-released (verified) released-by=${source}"
+    rm -f "$DEADLINE_FILE"
+  else
+    log "RELEASE FAILED released-by=${source} - chain and/or jump rules still present. iptables -S follows:"
+    iptables -S >> "$LOG"
+  fi
+}
+
 apply_isolation() {
-  cancel_pending_release
+  # Re-triggering while already isolated must reset the clock, not stack
+  # a second timer racing the first.
+  kill_stale_sleeper
 
   remove_isolation
   iptables -N "$CHAIN"
@@ -82,43 +152,106 @@ apply_isolation() {
   iptables -C OUTPUT -j "$CHAIN" 2>/dev/null || iptables -I OUTPUT 1 -j "$CHAIN"
 
   # Force out any already-established connections that aren't to a
-  # whitelisted peer (e.g. the attacker's own session to the lateral-
-  # movement target). Belt-and-suspenders: our rules are already static
-  # (no ESTABLISHED/RELATED accept), so the very next packet of a
-  # non-whitelisted flow is dropped regardless - this just makes the
-  # kernel forget the flow immediately instead of waiting for the peer's
-  # own retransmission/keepalive timeout to notice. A full flush is safe
-  # here specifically because nothing we allow depends on conntrack state
-  # - the whitelist rules above match on static IP/port, not connection
-  # state, so the manager heartbeat and the admin's own SSH reconnect
-  # using the same static rules immediately.
+  # whitelisted peer. Our rules are already static (no ESTABLISHED/RELATED
+  # accept), so the very next packet of a non-whitelisted flow is dropped
+  # regardless - this just makes the kernel forget the flow immediately
+  # instead of waiting for the peer's own retransmission/keepalive timeout.
   conntrack -F >/dev/null 2>&1
 
-  # Detached background timer - deliberately NOT `&` on the main shell (a
-  # plain backgrounded `sleep` would still be reaped/blocked if execd ever
-  # waits on this script's process group, which bit the original DDoS
-  # ip-limit.sh design - see roles/wazuh_ddos_rules). setsid fully detaches
-  # it into its own session so this invocation returns immediately and the
-  # NEXT Active Response call isn't serialized behind this sleep.
-  setsid bash -c "
-    sleep $TIMEOUT_SECONDS
-    $(declare -f remove_isolation)
-    remove_isolation
-    echo \"\$(date -u +%Y-%m-%dT%H:%M:%SZ) host-isolate.sh: auto-released after ${TIMEOUT_SECONDS}s\" >> '$LOG'
-    rm -f '$PIDFILE'
-  " < /dev/null > /dev/null 2>&1 &
-  echo $! > "$PIDFILE"
+  # DEADLINE_FILE holds "<epoch>:<token>". The token (not just the epoch,
+  # which could collide across rapid re-triggers within the same second)
+  # lets apply_isolation() invalidate any still-sleeping setsid sleeper
+  # from a PRIOR isolation window: that sleeper captured its OWN token at
+  # spawn time and, on waking, only proceeds with the release if its token
+  # still matches what's currently on disk. A re-trigger that resets the
+  # clock writes a brand-new token here, so an old sleeper that outlives
+  # kill_stale_sleeper's best-effort kill becomes a harmless no-op instead
+  # of releasing the new, still-active isolation early.
+  deadline=$(( $(date +%s) + TIMEOUT_SECONDS ))
+  token="${deadline}_${RANDOM}${RANDOM}"
+  echo "${deadline}:${token}" > "$DEADLINE_FILE"
 
-  log "isolation applied (auto-release in ${TIMEOUT_SECONDS}s, pid $!)"
+  setsid bash -c "sleep ${TIMEOUT_SECONDS}; '${SCRIPT_PATH}' --release timer '${token}'" </dev/null >/dev/null 2>&1 &
+  sleeper_pid=$!
+  disown
+  echo "$sleeper_pid" > "$SLEEPER_PID_FILE"
+
+  log "isolation applied (auto-release in ${TIMEOUT_SECONDS}s via detached sleeper pid ${sleeper_pid}, token ${token})"
 }
 
+# Called only from the --check-expiry path (Wazuh command wodle, every
+# 30s) and from the normal add/delete dispatch path (opportunistic
+# backstop on whatever AR invocation happens to come in next). Silent
+# no-op if there's no deadline file or it hasn't expired yet - this is
+# what keeps the 30s wodle from spamming the log on every tick.
+check_expired_deadline() {
+  local source="$1"
+  if [ -f "$DEADLINE_FILE" ]; then
+    local content deadline now
+    content=$(cat "$DEADLINE_FILE" 2>/dev/null)
+    deadline="${content%%:*}"
+    now=$(date +%s)
+    if [ -n "$deadline" ] && [ "$now" -ge "$deadline" ]; then
+      log "found expired deadline file (was due ${deadline}, now ${now}) - releasing via ${source}"
+      do_release "$source"
+    fi
+  fi
+}
+
+if [ "$1" = "--release" ]; then
+  SOURCE="${2:-manual}"
+  TOKEN="$3"
+  if [ "$SOURCE" = "timer" ]; then
+    CURRENT=$(cat "$DEADLINE_FILE" 2>/dev/null)
+    if [ -z "$CURRENT" ]; then
+      # Already released by something else in the meantime - nothing to do.
+      exit 0
+    fi
+    CURRENT_TOKEN="${CURRENT#*:}"
+    if [ "$TOKEN" != "$CURRENT_TOKEN" ]; then
+      log "stale timer fired (token ${TOKEN}) - a newer isolation is active (token ${CURRENT_TOKEN}), ignoring"
+      exit 0
+    fi
+  fi
+  do_release "$SOURCE"
+  exit 0
+fi
+
+if [ "$1" = "--check-expiry" ]; then
+  check_expired_deadline "wodle"
+  exit 0
+fi
+
+read -r INPUT_JSON
+check_expired_deadline "backstop"
+
+# CORRECTION #3 (see deviation list): the top-level "command" field in
+# wazuh-execd's real dispatch payload is ALWAYS "add" - that's
+# execd's own protocol-level "add this AR request to the queue" verb, not
+# our isolate/delete intent. The actual intent is
+# parameters.extra_args[0] (what the API caller passed as "arguments").
+# The original parser read the top-level "command" field directly, so it
+# read "add" on EVERY dispatch regardless of whether the caller asked for
+# isolate or delete - every "delete" call was silently re-isolating the
+# host instead of releasing it. Confirmed by capturing wazuh-execd's real
+# payload for both an isolate and a delete call side by side - both came
+# back with "command":"add" at the top level, differing only in
+# parameters.extra_args.
+COMMAND=$(echo "$INPUT_JSON" | grep -o '"extra_args"[[:space:]]*:[[:space:]]*\[[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]+)"$/\1/')
+
+# Audit trail for incidents like the 06:53:25 UTC one (see DEVIATIONS #24):
+# records only the resolved action, never the raw alert body/reason, so a
+# future misdispatch (or a future unexpected isolation) can be attributed
+# from this log alone instead of needing to cross-reference manager-side
+# api.log after the fact.
+log "dispatch received: resolved command=${COMMAND:-<unparsed>}"
+
 case "$COMMAND" in
-  add)
+  isolate)
     apply_isolation
     ;;
   delete)
-    cancel_pending_release
-    remove_isolation
+    do_release "manual"
     log "isolation manually released"
     ;;
   *)
