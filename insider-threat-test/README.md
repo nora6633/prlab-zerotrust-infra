@@ -115,7 +115,32 @@ docker exec dmz-ubuntu /var/ossec/active-response/bin/host-isolate.sh --release 
 
 1. **各 agent 的 `ossec.conf`**（`<client><server><address>`）：agent 不會自動重新指向新 IP，需要重新跑對應的 agent 部署 playbook（`deploy_windows_dmz.yml`/`deploy_dmz_ubuntu_nginx.yml`/`deploy_insider_threat_response.yml`）讓 agent 設定檔重新模板化＋重啟 `wazuh-agent`。驗證：`docker exec dmz-ubuntu grep -A1 '<server>' /var/ossec/etc/ossec.conf` 要顯示新 IP，且 `/var/ossec/bin/wazuh-control status` 顯示 agent 連線正常。
 2. **manager 上的 `custom-shuffle` 整合腳本**：這個檔案每次執行 `configure_integration.yml`/`configure_insider_threat_integration.yml` 都會用目前的 `wazuh_server_ip` 重新模板化＋複製進 manager 容器＋重啟 manager，所以只要重跑對應劇本就會自動更新，不需要額外手動處理。
-3. **已經匯入過的 Shuffle workflow 自己內部節點的 URL**（`wazuh_auth`、`wazuh_ar_isolate_host`、`wazuh_history_query`、`escalate_iris_alert`/`iris_log_alert` 等）：**這些不會自動更新**——Shuffle 在 import 當下把 `{{ wazuh_server_ip }}` 的渲染結果存成死值寫進它自己的資料庫，之後 `wazuh_server_ip` 改變並不會讓已存在的 workflow 跟著變（這是 DEVIATIONS #16 已經記錄過的已知問題，情境一二三的 workflow 都受影響）。要修正需要用跟 `set_force_off_hours.sh` 一樣的手法：`GET` 該 workflow、找出含舊 IP 的節點參數、替換成新 IP、`PUT` 寫回去（絕對不要用 import API 重新匯入，會造成重複）。驗證：抓下該 workflow 的 JSON，grep 裡面還有沒有舊 IP 字串。
+3. **已經匯入過的 Shuffle workflow 自己內部節點的 URL**（`wazuh_auth`、`wazuh_ar_block_*`、`wazuh_ar_isolate_host`、`wazuh_history`/`wazuh_history_query`、`escalate_iris_alert`/`iris_log_alert`/`notify_soc*` 等）：**這些不會自動更新**——Shuffle 在 import 當下把 `{{ wazuh_server_ip }}` 的渲染結果存成死值寫進它自己的資料庫，之後 `wazuh_server_ip` 改變並不會讓已存在的 workflow 跟著變（這是 DEVIATIONS #16 已經記錄過的已知問題，情境一二三的 workflow 都受影響過）。
+
+   修正用 `scripts/update_shuffle_workflow_ip.sh`（跟 `set_force_off_hours.sh` 同一手法：只用 `PUT` 改既有 workflow 裡命中的欄位，絕對不透過 import API，不會造成重複）：
+   ```
+   # 1. 先備份全部 workflow（gitignored，不進版控）
+   mkdir -p secrets/shuffle-backups/$(date -u +%Y%m%dT%H%M%SZ)
+   # （或參考這個腳本開發時用的手法，對 /api/v1/workflows 逐一 GET 存成 <id>.json）
+
+   # 2. 先 dry-run 看命中清單，不會改任何東西
+   scripts/update_shuffle_workflow_ip.sh <舊IP> <新IP> --dry-run
+
+   # 3. 確認範圍後逐一 --apply（建議一次只動一個 workflow id，每次跑完立刻重新
+   #    dry-run 確認該 workflow 命中數變 0，且 hook 的 start/trigger status 沒變）
+   scripts/update_shuffle_workflow_ip.sh <舊IP> <新IP> --apply --only <workflow_id>
+
+   # 如果某次 --apply 後發現不對，用備份還原（同樣先 dry-run 看會還原哪些再 --apply）
+   scripts/update_shuffle_workflow_ip.sh --restore <備份目錄> --dry-run
+   scripts/update_shuffle_workflow_ip.sh --restore <備份目錄> --apply --only <workflow_id>
+   ```
+   腳本會自動判斷「哪個是 hook 真正指向的那個版本」（直接讀 manager 上目前部署的 `custom-shuffle.py` 裡的 trigger id，不是猜的），在輸出裡標 `[ACTIVE]`。**只對 active 版本套用就夠了**——其他重複版本是 DEVIATIONS #16 提過、還沒清理的孤兒 workflow，不影響任何功能，修它們的 IP 純粹是為了「萬一以後 hook 不小心被切去指到其中一個」的保險，不是必要項目。2026-10-13 的一次實際套用只動了 IRIS/DDoS/USB-DLP 三個 active workflow（詳見 DEVIATIONS），17個孤兒版本的舊IP維持原樣。
+4. **workflow 節點裡的 `agents_list`（Active Response 要打給哪個 agent id，例如 `wazuh_ar_block_windows`/`wazuh_ar_block_linux`/`wazuh_ar_isolate_host` 的 `006`/`007`）：跟 IP 是完全一樣的問題**——這些也是 import 當下從 `soc.yml` 的 `dmz_windows_agent_id`/`dmz_ubuntu_agent_id`（情境一/二/三共用同一組 id）寫死進 URL 字串的，agent 重新註冊、Wazuh 重新分配 id 時，這些節點**不會自動跟著變**。`scripts/update_shuffle_workflow_ip.sh` 其實不是只處理 IP——它做的是任意字串的精確比對+替換，所以同一支腳本、同一套流程可以直接拿來改 agent id，把上面指令裡的 `<舊IP> <新IP>` 換成 `<舊agent_id> <新agent_id>` 即可，不需要另外的工具：
+   ```
+   scripts/update_shuffle_workflow_ip.sh <舊agent_id> <新agent_id> --dry-run
+   scripts/update_shuffle_workflow_ip.sh <舊agent_id> <新agent_id> --apply --only <workflow_id>
+   ```
+   換 agent id 時要特別小心命中清單裡標 `[ACTIVE]` 的那個是不是真的對應到你要換的那個 agent——同一個 `agents_list` 字串（例如 `006`）如果剛好也是別的東西的編號，字串比對不會知道語意，套用前務必先看過 dry-run 的命中清單（哪個 workflow、哪個節點、哪個欄位）再決定要不要 `--apply`。
 
 ### Shuffle alias 健康檢查
 
