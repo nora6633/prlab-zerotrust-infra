@@ -23,6 +23,13 @@ Posts to three webhooks with different filters:
      occurrence is forwarded. Shuffle's own scoring (usb_dlp_score_alert.py)
      needs every single event to compute its 10-minute same-endpoint
      history dimension; debouncing here would silently undercount it.
+  4. Insider-threat auto-response workflow — rules 100400-100410, see
+     roles/wazuh_insider_threat_rules. These are auditd-sourced, host-based
+     events with no data.srcip at all (same situation as 100500), so they
+     always take the "empty srcip = never debounced" path below and every
+     occurrence is forwarded - the workflow's own Wazuh-indexer history
+     query needs to see every event to reconstruct the attack-chain
+     progression depth, same reasoning as USB-DLP's 10-minute history.
 
 Failure on one webhook does not block the others.
 
@@ -61,6 +68,7 @@ import urllib.error
 IRIS_WEBHOOK_URL = "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_webhook_trigger_id }}"
 DDOS_WEBHOOK_URL = "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_ddos_webhook_trigger_id }}"
 USB_DLP_WEBHOOK_URL = "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_usb_dlp_webhook_trigger_id }}"
+INSIDER_THREAT_WEBHOOK_URL = "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_insider_threat_webhook_trigger_id }}"
 SHUFFLE_API_KEY = "{{ shuffle_default_apikey }}"
 
 # ddos-plan.txt Part 2: forward the escalation-worthy rules only, not the
@@ -73,6 +81,10 @@ DDOS_FORWARD_RULE_IDS = {"100210", "100212", "100213", "100221", "100222", "1002
 # Every occurrence of 100500 is forwarded (not a frequency rule - see module
 # docstring). roles/wazuh_usb_dlp_rules/files/local_rules_usb_dlp.xml.
 USB_DLP_FORWARD_RULE_IDS = {"100500"}
+
+# All of 100400-100410 (auditd-sourced, no data.srcip - never debounced,
+# same reasoning as 100500 above). roles/wazuh_insider_threat_rules/files/local_rules_insider_threat.xml.
+INSIDER_THREAT_FORWARD_RULE_IDS = {"100400", "100402", "100403", "100405", "100406", "100407", "100408", "100410"}
 
 DEBOUNCE_SECONDS = 10
 DEBOUNCE_DIR = "/tmp/custom-shuffle-debounce"
@@ -127,6 +139,9 @@ def main():
 
     if rule_id in USB_DLP_FORWARD_RULE_IDS:
         post(USB_DLP_WEBHOOK_URL, payload)
+
+    if rule_id in INSIDER_THREAT_FORWARD_RULE_IDS:
+        post(INSIDER_THREAT_WEBHOOK_URL, payload)
 
 
 if __name__ == "__main__":

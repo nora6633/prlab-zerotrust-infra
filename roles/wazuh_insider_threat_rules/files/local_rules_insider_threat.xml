@@ -72,20 +72,46 @@
   </rule>
 
   <!-- (4) C2: netcat argv contains port 4444 -> possible Metasploit C2
-       (T1571). SYSCALL (has audit.key/auid) and EXECVE (has the argv,
-       audit.execve.aN) are two SEPARATE Wazuh events sharing the same
-       audit.id - confirmed via wazuh-logtest that a same-line <match> (the
-       original thesis' approach) never sees the port, since the port
-       never appears on the SYSCALL line. Correlates across the two events
-       via if_matched_sid + same_field audit.id instead (confirmed working
-       both positive - port 4444 - and negative - port 80 does not fire -
-       via wazuh-logtest). -->
+       (T1571).
+
+       HISTORY (why this went back and forth): during early rule-design
+       testing via `wazuh-logtest`, feeding the SYSCALL and EXECVE lines
+       as two separate inputs made them decode as two fully independent
+       events (each ran its own Phase 1/2/3 pass) - audit.type on the
+       SYSCALL-derived event was never "EXECVE", so a same-line <match>
+       for the port number looked like it could never work, and this rule
+       was rewritten to use if_matched_sid + same_field audit.id to
+       correlate across the "two events" instead (which DID pass
+       wazuh-logtest, both the port-4444 positive case and the port-80
+       negative case).
+
+       That correlation design turned out to never actually fire against
+       the REAL manager pipeline, though (confirmed live: ran `nc
+       <ip> 4444`, got 100405 in alerts.json, but no 100403 - manual
+       `wazuh-logtest` replay of the exact captured real lines DID still
+       fire 100403, proving the rule logic itself was fine and the gap was
+       elsewhere). Root cause: the real agent-side `<log_format>audit`
+       logcollector merges every record sharing one audit.id (SYSCALL +
+       EXECVE + CWD + PATH + PROCTITLE) into a SINGLE multi-line event
+       before it ever reaches the manager - confirmed by inspecting the
+       resulting alert's own full_log field, which contains all five
+       lines concatenated, with data.audit.type fixed at "SYSCALL" and
+       data.audit.execve.a0/a1/a2 already present on that SAME event.
+       `wazuh-logtest`, invoked by feeding each line manually, does not
+       reproduce this merge - it only showed the "two separate events"
+       behavior because nothing simulated the real logcollector's
+       multi-line accumulation.
+
+       Net effect: the original thesis design (a same-line <match> off
+       the already-merged event) was right all along for the real
+       pipeline; the correlation rewrite solved a problem that only
+       existed in the wazuh-logtest testing method, not live. Reverted
+       back to the simple form and confirmed it fires on live traffic -
+       see the Phase 1 verification log. Listed in the deviation list as
+       an item that was wrong, then corrected, not a clean first pass. -->
   <rule id="100403" level="10">
-    <if_sid>80700</if_sid>
-    <field name="audit.type">^EXECVE$</field>
+    <if_sid>100405</if_sid>
     <match>4444</match>
-    <if_matched_sid>100405</if_matched_sid>
-    <same_field>audit.id</same_field>
     <description>Possible Metasploit C2: netcat to port 4444 by UID $(audit.auid)</description>
     <mitre>
       <id>T1571</id>
@@ -135,22 +161,25 @@
   <!-- Composite APT fast-path: 3 insider_threat-group events on the SAME
        host AND the SAME auid within 120s -> immediate isolation.
 
-       NOTE which rules actually carry the "insider_threat" group tag:
-       100400, 100402, 100405, 100403 only. 100406/100407/100408 use
-       "attack_chain_step" instead, so ssh/tar/curl do NOT count toward
-       this threshold. Sub-scenario C's own sequence (whoami, nmap, ssh,
-       tar) only produces 2 insider_threat-tagged hits (whoami, nmap), so
-       it can never reach this rule on its own - confirmed by reading the
-       group tags on every rule above, not assumed.
+       KNOWN BROKEN, root cause not yet fixed (see DEVIATIONS.md): this
+       rule reliably does not fire even under a 3-event burst that clearly
+       qualifies (confirmed live AND reproduced offline via wazuh-logtest
+       feeding the exact real audit.log full_log text for whoami/nmap/nc
+       in sequence). if_matched_group + frequency/same_field is a
+       documented-flaky combination in Wazuh's rule engine. A fan-in
+       <if_sid> marker + if_matched_sid approach was tried and reverted -
+       it broke 100400/100402/100403/100405's OWN alerts entirely (the
+       level-0 marker rule, being deeper in the if_sid chain, superseded
+       them as Wazuh's single "final" matched rule per log line, so nothing
+       downstream of those four ever fired either). Left as the original
+       (non-working for its own composite purpose, but non-regressing)
+       form pending further investigation.
 
        same_field audit.auid (added on top of the original thesis' design,
        which only had same_field agent.name) stops a different account's
        events on the same host from being counted toward this chain -
        confirmed via wazuh-logtest: an interleaved different-auid event is
-       correctly skipped. same_field agent.name could not be exercised via
-       wazuh-logtest directly (it has no real agent-forwarding context to
-       populate that field) - verify in Phase 1/2 against the real
-       agent-to-manager pipeline. -->
+       correctly skipped. -->
   <rule id="100410" level="14" frequency="3" timeframe="120">
     <if_matched_group>insider_threat</if_matched_group>
     <same_field>agent.name</same_field>

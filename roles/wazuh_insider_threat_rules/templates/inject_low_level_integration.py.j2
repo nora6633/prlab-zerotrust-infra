@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Inject a SECOND <integration name="custom-shuffle"> block into the Wazuh
+manager's host-side ossec.conf (idempotent), scoped by <rule_id> instead of
+<level>, so the scenario-3 rules below the shared wazuh_alert_min_level
+(7) still reach custom-shuffle.py without lowering that threshold for
+every other alert source in SOC (FreeIPA/Nextcloud/Mailcow/DDoS/USB-DLP).
+
+Confirmed live (integrator.debug=2, manual whoami/nmap test) that <rule_id>
+genuinely bypasses the <level> gate entirely when no <level> tag is present
+on the block, and that this does NOT double-dispatch rules also covered by
+the existing global block: integratord evaluates each <integration> block
+independently per alert and logs "Skipping: Rule doesn't match" for the
+block whose rule_id list doesn't include that rule, with no duplicate
+"File ... was written" entries observed for a single alert.
+
+Only 100400/100405/100406/100407/100408 are listed - 100402 (level 8),
+100403 (level 10), and 100410 (level 14) already clear the existing global
+<level>7</level> block and must NOT be duplicated here (confirmed this
+would otherwise double-dispatch them).
+"""
+import re
+import sys
+
+OSSEC_CONF = "{{ wazuh_manager_host_conf }}"
+START = "<!-- BEGIN: prlab-insider-threat-low-level-integration -->"
+END = "<!-- END: prlab-insider-threat-low-level-integration -->"
+
+block = f"""
+{START}
+<integration>
+    <name>custom-shuffle</name>
+    <rule_id>100400,100405,100406,100407,100408</rule_id>
+    <alert_format>json</alert_format>
+</integration>
+{END}
+""".strip()
+
+with open(OSSEC_CONF, "r") as f:
+    content = f.read()
+
+content = re.sub(
+    re.escape(START) + r".*?" + re.escape(END) + r"\s*",
+    "",
+    content,
+    flags=re.DOTALL,
+)
+
+marker = "</integration>"
+idx = content.find(marker)
+content = content[: idx + len(marker)] + "\n" + block + "\n" + content[idx + len(marker):]
+
+with open(OSSEC_CONF, "w") as f:
+    f.write(content)
+
+print("OK")
