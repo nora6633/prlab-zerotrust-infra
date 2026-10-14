@@ -124,28 +124,19 @@
       changed_when: insider_threat_workflow_import.stdout in ["200", "201"]
       failed_when: insider_threat_workflow_import.stdout not in ["200", "201"]
 
-    - name: Re-fetch workflow list if we just imported (to pick up the new entry)
+    # Always re-fetch (cheap) rather than branching on whether we just
+    # imported - guarantees shuffle_workflows_raw is fresh either way before
+    # the shared lookup below, instead of relying on two different facts
+    # depending on which branch ran.
+    - name: Re-fetch workflow list (picks up a fresh import; harmless no-op re-fetch otherwise)
       shell: |
         curl -ks -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
           "http://{{ wazuh_server_ip }}:5001/api/v1/workflows"
-      register: shuffle_workflows_raw_2
-      when: insider_threat_existing | length == 0
+      register: shuffle_workflows_raw
       changed_when: false
 
-    - name: Resolve the insider-threat trigger ID (freshly imported, or the one already found)
-      set_fact:
-        shuffle_insider_threat_actual_trig: >-
-          {{
-            ((shuffle_workflows_raw_2.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Insider-Threat Auto-Response') | sort(attribute='created', reverse=true) | first).triggers[0].id)
-            if insider_threat_existing | length == 0
-            else (insider_threat_existing | sort(attribute='created', reverse=true) | first).triggers[0].id
-          }}
-        shuffle_insider_threat_actual_wf: >-
-          {{
-            ((shuffle_workflows_raw_2.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Insider-Threat Auto-Response') | sort(attribute='created', reverse=true) | first).id)
-            if insider_threat_existing | length == 0
-            else (insider_threat_existing | sort(attribute='created', reverse=true) | first).id
-          }}
+    - name: Resolve the insider-threat workflow's current id/trigger id (shared with configure_integration.yml)
+      include_tasks: tasks/resolve_insider_threat_trigger.yml
 
     - debug:
         msg:

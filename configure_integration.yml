@@ -140,6 +140,26 @@
         shuffle_ddos_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | first).triggers[0].id }}"
         shuffle_usb_dlp_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh USB-DLP Auto-Response') | first).triggers[0].id }}"
 
+    # custom-shuffle.py is re-rendered below on every run of this playbook -
+    # look up the insider-threat workflow's CURRENT trigger id (if scenario 3
+    # has already been deployed) so that re-render doesn't clobber it back to
+    # group_vars/soc.yml's permanently-stale CHANGE_ME placeholder. See
+    # tasks/resolve_insider_threat_trigger.yml's header comment for why this
+    # exists.
+    #
+    # Capture the group_vars value under a different name BEFORE the lookup -
+    # referencing shuffle_insider_threat_webhook_trigger_id inside its own
+    # default() below (same name on both sides) is a self-reference that
+    # Ansible's templating engine treats as a recursive loop, not a safe
+    # "fall through to the outer-scope value" - confirmed live
+    # (RecursionError / "recursive loop detected in template string").
+    - name: Capture group_vars' insider-threat trigger id as a fallback (different name, avoids a templating self-reference below)
+      set_fact:
+        shuffle_insider_threat_webhook_trigger_id_fallback: "{{ shuffle_insider_threat_webhook_trigger_id }}"
+
+    - name: Look up the insider-threat workflow's current trigger id, if deployed (shared with configure_insider_threat_integration.yml)
+      include_tasks: tasks/resolve_insider_threat_trigger.yml
+
     - name: Show captured trigger IDs
       debug:
         msg:
@@ -178,6 +198,7 @@
         shuffle_webhook_trigger_id: "{{ shuffle_iris_actual_trig }}"
         shuffle_ddos_webhook_trigger_id: "{{ shuffle_ddos_actual_trig }}"
         shuffle_usb_dlp_webhook_trigger_id: "{{ shuffle_usb_dlp_actual_trig }}"
+        shuffle_insider_threat_webhook_trigger_id: "{{ shuffle_insider_threat_actual_trig | default(shuffle_insider_threat_webhook_trigger_id_fallback) }}"
 
     - name: Copy integration script into single-node-wazuh.manager-1 container
       command: docker cp /tmp/custom-shuffle single-node-wazuh.manager-1:/var/ossec/integrations/custom-shuffle
