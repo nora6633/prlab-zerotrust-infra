@@ -26,11 +26,14 @@ services:
     image: ghcr.io/dfir-iris/iriswebapp_app:{{ iris_version }}
     container_name: iriswebapp_app
     restart: always
+    command: ["/bin/bash", "-c", "until bash -c 'echo > /dev/tcp/iriswebapp_db/5432' 2>/dev/null; do echo 'Waiting for DB...'; sleep 3; done && gunicorn app:app --worker-class eventlet --bind 0.0.0.0:8000 --timeout 180 --worker-connections 1000 --log-level=info"]
     environment:
       - POSTGRES_SERVER=iriswebapp_db
       - POSTGRES_PORT=5432
       - POSTGRES_USER=iris
       - POSTGRES_PASSWORD={{ iris_db_password }}
+      - POSTGRES_ADMIN_USER=iris
+      - POSTGRES_ADMIN_PASSWORD={{ iris_db_password }}
       - POSTGRES_DB=iris_db
       - IRIS_SECRET_KEY={{ iris_secret_key }}
       - IRIS_SECURITY_PASSWORD_SALT={{ iris_secret_key }}
@@ -57,6 +60,8 @@ services:
       - POSTGRES_PORT=5432
       - POSTGRES_USER=iris
       - POSTGRES_PASSWORD={{ iris_db_password }}
+      - POSTGRES_ADMIN_USER=iris
+      - POSTGRES_ADMIN_PASSWORD={{ iris_db_password }}
       - POSTGRES_DB=iris_db
       - IRIS_SECRET_KEY={{ iris_secret_key }}
       - IRIS_SECURITY_PASSWORD_SALT={{ iris_secret_key }}
@@ -74,12 +79,19 @@ services:
     image: ghcr.io/dfir-iris/iriswebapp_nginx:{{ iris_version }}
     container_name: iriswebapp_nginx
     restart: always
+    environment:
+      - CERT_FILENAME=iris.crt
+      - KEY_FILENAME=iris.key
+      - INTERFACE_HTTPS_PORT=443
+      - SERVER_NAME=iris.{{ domain }}
+      - IRIS_UPSTREAM_SERVER=iriswebapp_app
+      - IRIS_UPSTREAM_PORT=8000
     ports:
       - "4444:443"
     depends_on:
       - iriswebapp_app
     volumes:
-      - iris-certificates:/www/certs
+      - "{{ deploy_base_dir }}/dfir-iris/certificates:/www/certs:ro"
 
 volumes:
   iris-db-data:
