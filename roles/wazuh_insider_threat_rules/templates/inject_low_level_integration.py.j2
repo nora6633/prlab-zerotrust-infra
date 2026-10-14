@@ -19,7 +19,9 @@ Only 100400/100405/100406/100407/100408 are listed - 100402 (level 8),
 would otherwise double-dispatch them).
 """
 import re
+import shutil
 import sys
+import xml.etree.ElementTree as ET
 
 OSSEC_CONF = "{{ wazuh_manager_host_conf }}"
 START = "<!-- BEGIN: prlab-insider-threat-low-level-integration -->"
@@ -38,6 +40,12 @@ block = f"""
 with open(OSSEC_CONF, "r") as f:
     content = f.read()
 
+# Idempotent no-op: this exact block (by marker) is already present verbatim.
+if block in content:
+    print("NOCHANGE")
+    sys.exit(0)
+
+# Strip any stale/previous copy of this role's block before reinserting.
 content = re.sub(
     re.escape(START) + r".*?" + re.escape(END) + r"\s*",
     "",
@@ -45,11 +53,32 @@ content = re.sub(
     flags=re.DOTALL,
 )
 
-marker = "</integration>"
-idx = content.find(marker)
-content = content[: idx + len(marker)] + "\n" + block + "\n" + content[idx + len(marker):]
+close_marker = "</integration>"
+last_idx = content.rfind(close_marker)
+if last_idx != -1:
+    insert_at = last_idx + len(close_marker)
+else:
+    open_marker = "<ossec_config>"
+    idx = content.find(open_marker)
+    if idx == -1:
+        print(f"ERROR: neither {close_marker!r} nor {open_marker!r} found in {OSSEC_CONF} - refusing to modify", file=sys.stderr)
+        sys.exit(1)
+    insert_at = idx + len(open_marker)
+
+new_content = content[:insert_at] + "\n" + block + "\n" + content[insert_at:]
+
+# ossec.conf may legitimately contain multiple sibling <ossec_config> root
+# blocks concatenated together (Wazuh's own loader wraps the whole file in a
+# synthetic root before parsing) - do the same here before validating.
+try:
+    ET.fromstring(f"<root>{new_content}</root>")
+except ET.ParseError as e:
+    print(f"ERROR: resulting {OSSEC_CONF} would not be well-formed XML, not writing: {e}", file=sys.stderr)
+    sys.exit(1)
+
+shutil.copy2(OSSEC_CONF, OSSEC_CONF + ".bak")
 
 with open(OSSEC_CONF, "w") as f:
-    f.write(content)
+    f.write(new_content)
 
-print("OK")
+print("CHANGED")

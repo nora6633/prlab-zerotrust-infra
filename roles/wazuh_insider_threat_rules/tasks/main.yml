@@ -26,7 +26,7 @@
 - name: Inject the rule_id-scoped second <integration> block (survives restart)
   command: python3 /tmp/inject_low_level_integration_insider_threat.py
   register: inject_integration_result
-  changed_when: "'OK' in inject_integration_result.stdout"
+  changed_when: "'CHANGED' in inject_integration_result.stdout"
 
 - name: Restart Wazuh manager to pick up new rules + AR config
   command: docker restart single-node-wazuh.manager-1
