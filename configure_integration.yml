@@ -15,6 +15,30 @@
   gather_facts: true
 
   tasks:
+    # ── Fail fast if any value this playbook bakes into a Shuffle workflow
+    # or custom-shuffle.py is still a placeholder. Shuffle stores imported
+    # values as static JSON (it does not re-read group_vars later), so a
+    # CHANGE_ME here gets baked into a live, hard-to-detect broken system
+    # instead of failing loudly up front. dmz_windows_agent_id is
+    # deliberately NOT checked - a topology with no Windows DMZ host
+    # legitimately has no value to put there. ──────────────────────────────
+    - name: Fail fast if required credentials/identifiers are still placeholders
+      assert:
+        that:
+          - wazuh_indexer_password != "CHANGE_ME" and (wazuh_indexer_password | length > 0)
+          - wazuh_api_password != "CHANGE_ME" and (wazuh_api_password | length > 0)
+          - wazuh_server_ip | length > 0
+          - dmz_ubuntu_agent_id != "CHANGE_ME" and (dmz_ubuntu_agent_id | length > 0)
+          - iris_adm_api_key != "CHANGE_ME" and (iris_adm_api_key | length > 0)
+          - abuseipdb_api_key != "CHANGE_ME" and (abuseipdb_api_key | length > 0)
+        fail_msg: >-
+          One or more group_vars/soc.yml values this playbook bakes into a
+          Shuffle workflow or custom-shuffle.py are still "CHANGE_ME" or
+          empty: check wazuh_indexer_password, wazuh_api_password,
+          wazuh_server_ip, dmz_ubuntu_agent_id, iris_adm_api_key, and
+          abuseipdb_api_key. Fix the offending variable(s) in
+          group_vars/soc.yml before running this playbook.
+
     # ── Shuffle: import workflow ──────────────────────────────────────────
     - name: Ensure Shuffle backend is reachable
       uri:
@@ -173,6 +197,7 @@
     - name: Inject Shuffle integration block into host-side wazuh_manager.conf
       command: python3 /tmp/inject_integration.py
       register: inject_result
+      changed_when: "'CHANGED' in inject_result.stdout"
 
     - name: Show injection result
       debug:

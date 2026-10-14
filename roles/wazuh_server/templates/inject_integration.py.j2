@@ -1,33 +1,81 @@
 #!/usr/bin/env python3
 """
-Injects the Shuffle integration block into Wazuh's host-side wazuh_manager.conf.
-Modifications to /var/ossec/etc/ossec.conf inside the container do NOT survive
-restarts — the entrypoint copies wazuh_manager.conf back into place each time.
-Run on the SOC host (not via docker exec).
-"""
-config_file = "{{ wazuh_manager_host_conf }}"
+Injects the GLOBAL Shuffle integration block (<level>{{ wazuh_alert_min_level }}</level>,
+no <rule_id> restriction - catches every alert at or above that level) into Wazuh's
+host-side wazuh_manager.conf. Modifications to /var/ossec/etc/ossec.conf inside the
+container do NOT survive restarts - the entrypoint copies wazuh_manager.conf back
+into place each time. Run on the SOC host (not via docker exec).
 
-integration_block = """
+Idempotency is judged by parsing for an EXISTING <integration> block whose <name>
+is "custom-shuffle" and which has no <rule_id> tag (i.e. a block matching this
+one's own semantics), not by a naive string search for "custom-shuffle" - that
+naive check previously false-positived against wazuh_insider_threat_rules'
+separate <rule_id>-scoped block (same <name>, deliberately no <level> tag), which
+meant this global block silently never got inserted whenever the insider-threat
+role's injection happened to run first, and alerts above wazuh_insider_threat_rules'
+hardcoded rule_id list (e.g. rule 100403) never reached Shuffle at all.
+This same block-parsing check also means a hand-rolled/pre-existing global
+custom-shuffle block from before this marker convention existed (no BEGIN/END
+comment) is still correctly recognized as "already present" - its own marker
+is only needed to let a later run of THIS script cleanly re-render the block
+if wazuh_alert_min_level changes, not to detect that it exists at all.
+"""
+import re
+import shutil
+import sys
+import xml.etree.ElementTree as ET
+
+OSSEC_CONF = "{{ wazuh_manager_host_conf }}"
+START = "<!-- BEGIN: prlab-shuffle-global-integration -->"
+END = "<!-- END: prlab-shuffle-global-integration -->"
+
+block = f"""
+{START}
   <integration>
     <name>custom-shuffle</name>
     <level>{{ wazuh_alert_min_level }}</level>
     <alert_format>json</alert_format>
   </integration>
-"""
+{END}
+""".strip()
 
-with open(config_file) as f:
+
+def has_global_custom_shuffle_block(text):
+    for m in re.finditer(r"<integration>(.*?)</integration>", text, re.DOTALL):
+        body = m.group(1)
+        name_m = re.search(r"<name>\s*([^<]+?)\s*</name>", body)
+        if name_m and name_m.group(1).strip() == "custom-shuffle" and "<rule_id>" not in body:
+            return True
+    return False
+
+
+with open(OSSEC_CONF, "r") as f:
     content = f.read()
 
-if "custom-shuffle" in content:
-    print("Shuffle integration already present in ossec.conf — skipping.")
-else:
-    # count=1 so we only insert before the FIRST </ossec_config> (the main config block;
-    # ossec.conf typically has a second block dedicated to active-responses.log).
-    content = content.replace(
-        "</ossec_config>",
-        integration_block + "</ossec_config>",
-        1,
-    )
-    with open(config_file, "w") as f:
-        f.write(content)
-    print("Shuffle integration block injected into ossec.conf.")
+if has_global_custom_shuffle_block(content):
+    print("NOCHANGE")
+    sys.exit(0)
+
+close_tag = "</ossec_config>"
+idx = content.find(close_tag)
+if idx == -1:
+    print(f"ERROR: {close_tag!r} not found in {OSSEC_CONF} - refusing to modify", file=sys.stderr)
+    sys.exit(1)
+
+new_content = content[:idx] + block + "\n" + content[idx:]
+
+# ossec.conf may legitimately contain multiple sibling <ossec_config> root
+# blocks concatenated together (Wazuh's own loader wraps the whole file in a
+# synthetic root before parsing) - do the same here before validating.
+try:
+    ET.fromstring(f"<root>{new_content}</root>")
+except ET.ParseError as e:
+    print(f"ERROR: resulting {OSSEC_CONF} would not be well-formed XML, not writing: {e}", file=sys.stderr)
+    sys.exit(1)
+
+shutil.copy2(OSSEC_CONF, OSSEC_CONF + ".bak")
+
+with open(OSSEC_CONF, "w") as f:
+    f.write(new_content)
+
+print("CHANGED")
