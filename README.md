@@ -142,14 +142,33 @@ The Architecture diagram above describes 3 logically separate hosts (External/SO
 
 - The `soc` group's `ansible_host` is the Docker host's own address (same machine Ansible runs on), with `ansible_connection=local`.
 - `external`/`lan` point at container IPs on their own bridge networks, not separate VMs.
-- **`dmz-ubuntu/` and `ubuntu-lan/` (their Dockerfile + `docker-compose.yaml`) are not deployed by `site.yml` or any other role in this repo** — if you're using these containers as stand-ins for the external/LAN hosts, run `bootstrap_scenario_hosts.yml` first, before anything else:
+- **`dmz-ubuntu/` and `ubuntu-lan/` (their Dockerfile + `docker-compose.yaml`) are not deployed by `site.yml` or any other role in this repo** — if you're using these containers as stand-ins for the external/LAN hosts, the full order for a from-scratch scenario-3 deployment is:
   ```bash
+  # 1. Fill in group_vars/soc.yml FIRST (see group_vars/soc.yml.example) - every
+  #    CHANGE_ME must be replaced before running configure_integration.yml, or
+  #    the placeholder gets permanently baked into a live Shuffle workflow
+  #    (see note below).
+  #    dmz_ubuntu_agent_id/dmz_windows_agent_id CANNOT be filled in yet at this
+  #    point - they're assigned by Wazuh at agent registration time, which
+  #    hasn't happened. Leave them as CHANGE_ME for now and come back after step 2.
+
   ansible-playbook -i inventory/hosts.ini bootstrap_scenario_hosts.yml
   ansible-playbook -i inventory/hosts.ini site.yml
+
+  # 2. Agents are now registered - look up the real IDs and fill them into
+  #    group_vars/soc.yml before continuing (don't assume example values like
+  #    "007" - a fresh single-agent lab typically registers as "001"):
+  #    docker exec single-node-wazuh.manager-1 /var/ossec/bin/agent_control -l
+
+  ansible-playbook -i inventory/hosts.ini configure_integration.yml                  # imports IRIS/DDoS/USB-DLP workflows - run this even if you only want scenario 3, see note below
   ansible-playbook -i inventory/hosts.ini deploy_insider_threat_response.yml          # only if using insider-threat-test/
   ansible-playbook -i inventory/hosts.ini configure_insider_threat_integration.yml    # only if using insider-threat-test/
   ```
   `bootstrap_scenario_hosts.yml` creates the `dmz-ubuntu_default` and `scenario3-link` networks (both declared `external: true` in `dmz-ubuntu/docker-compose.yaml` — yes, both, even if you only want the plain DDoS/Juice-Shop use of this host and have no interest in scenario 3; see the playbook's own header comment) and builds/starts both containers. It's idempotent - safe to re-run, never recreates an already-running container or touches its volumes. Confirm the subnet it picks matches what `inventory/hosts.ini` expects to SSH into (`docker network inspect dmz-ubuntu_default`).
+
+  ⚠️ **`configure_insider_threat_integration.yml` cannot run standalone** despite scoping itself to "scenario 3 only" - it looks up the *currently active* IRIS/DDoS/USB-DLP Shuffle trigger IDs (deliberately without re-importing them) to wire the shared `custom-shuffle` forwarding script, so those three workflows must already exist. Run `configure_integration.yml` at least once first.
+
+  ⚠️ **Any value baked into a Shuffle workflow or `custom-shuffle.py` at import time is frozen from that point on** - Shuffle stores imported workflow JSON as a static document, it does not re-read `group_vars/soc.yml` later. If you edit `wazuh_indexer_password`, `wazuh_api_password`, `wazuh_server_ip`, `dmz_ubuntu_agent_id`, `dmz_windows_agent_id`, `iris_adm_api_key`, `abuseipdb_api_key`, or `shuffle_default_apikey` *after* already running `configure_integration.yml`/`configure_insider_threat_integration.yml`, the already-imported workflow keeps using the old value - the fix doesn't take effect until you delete that specific workflow in Shuffle and re-run the playbook that imports it. Both playbooks now assert on startup that none of their required values are still `CHANGE_ME`/empty, to catch this before it silently gets baked in - but that only protects the *first* import, not a later edit to an already-deployed value. In particular: if you deploy scenario 3 first and only add the Windows agent later, `dmz_windows_agent_id` was still `CHANGE_ME` when the DDoS/USB-DLP workflows were imported, and filling it in afterward does not retroactively fix them - delete both workflows in Shuffle and re-run `configure_integration.yml` for the real agent ID to take effect.
 
   ⚠️ Both Dockerfiles bake in a `dev` account with a hardcoded, lab-only password (an SSH key is also baked in and preferred for actual access) — change or remove that password before using either Dockerfile outside a throwaway lab.
 - If a scenario's own setup (e.g. `insider-threat-test/`) requires host-level `auditd`, that specifically needs a real machine or VM for the `soc` host - it cannot run inside a container (no access to the kernel audit netlink socket). See `insider-threat-test/README.md`'s prerequisites.

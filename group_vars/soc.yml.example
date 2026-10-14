@@ -26,7 +26,13 @@ shuffle_insider_threat_webhook_trigger_id: "CHANGE_ME"
 
 # ── Wazuh API (used by the DDoS/insider-threat AUTO_BLOCK paths to call
 #    PUT /active-response, and by insider-threat-test/run_attack.sh's
-#    --reset). Same credential the dashboard uses (wazuh.yml.j2).
+#    --reset). This MUST exactly match the password hardcoded in
+#    roles/wazuh_server/templates/wazuh.yml.j2 (the `password:` field,
+#    currently line 6 of that file - check the live value there, don't
+#    copy a value from here) - it is NOT actually templated from this
+#    value despite living in soc.yml (that file hardcodes the dashboard's
+#    own copy of this credential). Changing this value here without also
+#    changing wazuh.yml.j2 breaks AR dispatch auth silently.
 wazuh_api_user: "wazuh-wui"
 wazuh_api_password: "CHANGE_ME"
 
@@ -34,15 +40,34 @@ wazuh_api_password: "CHANGE_ME"
 #    These are assigned by Wazuh at agent registration time, NOT something
 #    you choose - after enrolling agents, check the real values with
 #    `agent_control -l` on the manager and fill them in here. They are not
-#    secrets, just environment-specific IDs.
-dmz_windows_agent_id: "CHANGE_ME"   # e.g. "006"
-dmz_ubuntu_agent_id: "CHANGE_ME"    # e.g. "007"
+#    secrets, just environment-specific IDs. Don't assume the example
+#    values below - a fresh single-agent lab typically registers its first
+#    (and often only) agent as "001", not "006"/"007"; the numbers here are
+#    illustrative only, not a convention this repo enforces.
+dmz_windows_agent_id: "CHANGE_ME"   # query agent_control -l, don't guess
+dmz_ubuntu_agent_id: "CHANGE_ME"    # query agent_control -l, don't guess
 
 # ── AbuseIPDB (scenario 2, N3) ───────────────────────────────────────────
 # Get a free key at https://www.abuseipdb.com/account/api
 abuseipdb_api_key: "CHANGE_ME"
 
 # ── Wazuh indexer (N4 history query / insider-threat progression lookup) ──
+# wazuh_indexer_password MUST exactly match the upstream wazuh-docker
+# project's own hardcoded INDEXER_PASSWORD (currently "SecretPassword" in
+# that project's docker-compose.yml, cloned by roles/wazuh_server - check
+# {{ deploy_base_dir }}/wazuh/wazuh-docker/single-node/docker-compose.yml
+# for the live value, it can change across wazuh-docker releases). This is
+# not actually templated from this value either, same caveat as
+# wazuh_api_password above.
+#
+# ⚠️ If you fill this in (or change it) AFTER already running
+# configure_integration.yml/configure_insider_threat_integration.yml, the
+# fix does NOT retroactively apply - Shuffle bakes whatever this value was
+# at import time as a static string into the workflow's own stored JSON.
+# You must delete the affected workflow in Shuffle and re-run the playbook
+# that imports it for a later correction to take effect. Both playbooks
+# assert this is not CHANGE_ME/empty before running, but that only
+# protects the first import.
 wazuh_indexer_url: "https://{{ wazuh_server_ip }}:9200"
 wazuh_indexer_user: "admin"
 wazuh_indexer_password: "CHANGE_ME"
