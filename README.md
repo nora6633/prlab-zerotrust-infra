@@ -71,6 +71,13 @@ Wazuh Manager
 │   └── wazuh_ddos_rules/                ← custom decoder/rules + AR config injection
 ├── windows-dmz/
 │   └── setup-dmz.ps1                    ← manual PowerShell fallback (no Ansible)
+├── dmz-ubuntu/                          ← Dockerfile + compose for a container standing in for
+│   └── docker-compose.yaml                the Linux "external" host (single-machine topology
+│                                           only - see "Single machine simulating 3 hosts" below)
+├── ubuntu-lan/                          ← same, standing in for the "lan" host
+│   └── docker-compose.yaml
+├── bootstrap_scenario_hosts.yml         ← creates dmz-ubuntu/ + ubuntu-lan/ containers (run
+│                                           this first if using the single-machine topology)
 ├── site.yml                             ← deploy all services (Linux external)
 ├── deploy_windows_dmz.yml               ← deploy external host as Windows DMZ
 ├── deploy_soc_remaining.yml             ← resume partial SOC deploy (Shuffle + IRIS)
@@ -133,16 +140,16 @@ The Architecture diagram above describes 3 logically separate hosts (External/SO
 
 - The `soc` group's `ansible_host` is the Docker host's own address (same machine Ansible runs on), with `ansible_connection=local`.
 - `external`/`lan` point at container IPs on their own bridge networks, not separate VMs.
-- **`dmz-ubuntu/docker-compose.yaml` and `ubuntu-lan/docker-compose.yaml` are not deployed by any Ansible role in this repo** — nothing here runs `docker compose up` for them. If you're using these containers as stand-ins for the external/LAN hosts, you have to build and start them yourself before `site.yml`'s `external`/`lan` plays can even SSH in:
+- **`dmz-ubuntu/` and `ubuntu-lan/` (their Dockerfile + `docker-compose.yaml`) are not deployed by `site.yml` or any other role in this repo** — if you're using these containers as stand-ins for the external/LAN hosts, run `bootstrap_scenario_hosts.yml` first, before anything else:
   ```bash
-  # dmz-ubuntu declares its own network as external:true - create it first
-  docker network create dmz-ubuntu_default
-  cd dmz-ubuntu && docker compose build && docker compose up -d
-
-  # ubuntu-lan's default network is NOT external - compose creates it itself
-  cd ubuntu-lan && docker compose build && docker compose up -d
+  ansible-playbook -i inventory/hosts.ini bootstrap_scenario_hosts.yml
+  ansible-playbook -i inventory/hosts.ini site.yml
+  ansible-playbook -i inventory/hosts.ini deploy_insider_threat_response.yml          # only if using insider-threat-test/
+  ansible-playbook -i inventory/hosts.ini configure_insider_threat_integration.yml    # only if using insider-threat-test/
   ```
-  Confirm the subnet/IP `docker network create` picks matches what `inventory/hosts.ini` expects to SSH into (`docker network inspect dmz-ubuntu_default` after creation). This whole bootstrapping step is undocumented elsewhere in this repo - if you know of an existing automated path for it, this note should be corrected.
+  `bootstrap_scenario_hosts.yml` creates the `dmz-ubuntu_default` and `scenario3-link` networks (both declared `external: true` in `dmz-ubuntu/docker-compose.yaml` — yes, both, even if you only want the plain DDoS/Juice-Shop use of this host and have no interest in scenario 3; see the playbook's own header comment) and builds/starts both containers. It's idempotent - safe to re-run, never recreates an already-running container or touches its volumes. Confirm the subnet it picks matches what `inventory/hosts.ini` expects to SSH into (`docker network inspect dmz-ubuntu_default`).
+
+  ⚠️ Both Dockerfiles bake in a `dev` account with a hardcoded, lab-only password (an SSH key is also baked in and preferred for actual access) — change or remove that password before using either Dockerfile outside a throwaway lab.
 - If a scenario's own setup (e.g. `insider-threat-test/`) requires host-level `auditd`, that specifically needs a real machine or VM for the `soc` host - it cannot run inside a container (no access to the kernel audit netlink socket). See `insider-threat-test/README.md`'s prerequisites.
 
 ---
