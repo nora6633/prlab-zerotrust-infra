@@ -16,6 +16,37 @@
   hosts: soc
   become: true
   gather_facts: true
+  pre_tasks:
+    # wazuh_server, shuffle, and dfir_iris each pass several group_vars/soc.yml
+    # values straight into a service's own first-boot init (Postgres role
+    # password, RabbitMQ password, IRIS admin account, Shuffle default
+    # admin/apikey...). Those services only run their init scripts ONCE, on
+    # an empty data directory - changing the value in soc.yml afterward does
+    # NOT update the already-initialized service, so a placeholder left in
+    # place here gets silently baked in as a permanent, wrong credential
+    # instead of failing loudly. Only checks variables this specific play's
+    # three roles actually consume this way.
+    - name: Fail fast if any value that gets permanently written into a service's volume/database at first init is still a placeholder
+      assert:
+        that:
+          - (iris_db_password | length > 0) and not (iris_db_password.startswith('CHANGE_ME'))
+          - (iris_admin_password | length > 0) and not (iris_admin_password.startswith('CHANGE_ME'))
+          - (iris_secret_key | length > 0) and not (iris_secret_key.startswith('CHANGE_ME'))
+          - (iris_rabbitmq_password | length > 0) and not (iris_rabbitmq_password.startswith('CHANGE_ME'))
+          - (iris_adm_api_key | length > 0) and not (iris_adm_api_key.startswith('CHANGE_ME'))
+          - (shuffle_admin_password | length > 0) and not (shuffle_admin_password.startswith('CHANGE_ME'))
+          - (shuffle_default_apikey | length > 0) and not (shuffle_default_apikey.startswith('CHANGE_ME'))
+        fail_msg: >-
+          One or more group_vars/soc.yml values that get permanently written
+          into a service's volume/database the first time it initializes are
+          still a CHANGE_ME-style placeholder (including variants like
+          CHANGE_ME_AT_LEAST_32_CHARS) or empty: check iris_db_password,
+          iris_admin_password, iris_secret_key, iris_rabbitmq_password,
+          iris_adm_api_key, shuffle_admin_password, and shuffle_default_apikey.
+          These must be filled in BEFORE the first deployment - changing one
+          afterward does not update the already-initialized service; you
+          would need to remove that service's data volume and let it
+          reinitialize instead.
   roles:
     - wazuh_server
     - shuffle
