@@ -28,13 +28,19 @@ shuffle_insider_threat_webhook_trigger_id: "CHANGE_ME"
 #    PUT /active-response, and by insider-threat-test/run_attack.sh's
 #    --reset). This MUST exactly match the password hardcoded in
 #    roles/wazuh_server/templates/wazuh.yml.j2 (the `password:` field,
-#    currently line 6 of that file - check the live value there, don't
-#    copy a value from here) - it is NOT actually templated from this
-#    value despite living in soc.yml (that file hardcodes the dashboard's
-#    own copy of this credential). Changing this value here without also
-#    changing wazuh.yml.j2 breaks AR dispatch auth silently.
+#    currently line 6 of that file - check the live value there, it can
+#    change) - it is NOT actually templated from this value despite living
+#    in soc.yml (that file hardcodes the dashboard's own copy of this
+#    credential). The value below is that upstream wazuh-docker project's
+#    own public default for v4.9.2 (not a secret specific to this repo or
+#    deployment) - it's filled in here, matching the template, specifically
+#    so this doesn't read as a CHANGE_ME placeholder and trip the
+#    first-run-credential assert in configure_integration.yml. For a real
+#    (non-lab) deployment, change this AND wazuh.yml.j2's hardcoded copy
+#    together - leaving either one as the public upstream default is a
+#    real credential exposure outside a throwaway lab.
 wazuh_api_user: "wazuh-wui"
-wazuh_api_password: "CHANGE_ME"
+wazuh_api_password: "MyS3cr37P450r.*-"
 
 # ── DMZ agent IDs (used to target the right agent for Active Response).
 #    These are assigned by Wazuh at agent registration time, NOT something
@@ -53,12 +59,16 @@ abuseipdb_api_key: "CHANGE_ME"
 
 # ── Wazuh indexer (N4 history query / insider-threat progression lookup) ──
 # wazuh_indexer_password MUST exactly match the upstream wazuh-docker
-# project's own hardcoded INDEXER_PASSWORD (currently "SecretPassword" in
-# that project's docker-compose.yml, cloned by roles/wazuh_server - check
+# project's own hardcoded INDEXER_PASSWORD (check
 # {{ deploy_base_dir }}/wazuh/wazuh-docker/single-node/docker-compose.yml
-# for the live value, it can change across wazuh-docker releases). This is
-# not actually templated from this value either, same caveat as
-# wazuh_api_password above.
+# for the live value - it can change across wazuh-docker releases, the
+# value below is that upstream project's own public default for the
+# wazuh_version pinned in group_vars/all.yml). This is not actually
+# templated from this value either, same caveat as wazuh_api_password
+# above - and the same "public upstream default, not a secret specific to
+# this deployment" reasoning: it's filled in here to match the template
+# and avoid tripping the first-run-credential assert, not because it's
+# safe to leave as-is outside a throwaway lab.
 #
 # ⚠️ If you fill this in (or change it) AFTER already running
 # configure_integration.yml/configure_insider_threat_integration.yml, the
@@ -70,7 +80,7 @@ abuseipdb_api_key: "CHANGE_ME"
 # protects the first import.
 wazuh_indexer_url: "https://{{ wazuh_server_ip }}:9200"
 wazuh_indexer_user: "admin"
-wazuh_indexer_password: "CHANGE_ME"
+wazuh_indexer_password: "SecretPassword"
 
 # ── SOC notification (NOTIFY_SOC email) ──────────────────────────────────
 soc_notify_email: "soc@example.lab"

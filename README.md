@@ -136,13 +136,91 @@ Set-Item WSMan:\localhost\Service\Auth\Basic $true
 Set-Item WSMan:\localhost\Service\AllowUnencrypted $true   # lab only
 ```
 
+### Fresh host/VM setup
+
+If you're starting from a brand new machine/VM with nothing installed yet, here's the exact sequence that's been verified to work end to end. All commands below are for Ubuntu 24.04.
+
+**Clone.** This repo's own `git remote` is configured over SSH for the maintainer's own push access - that URL will fail with `Host key verification failed` on a machine with no SSH key registered against it. Use the HTTPS form instead (works with no authentication, since this repo is public):
+
+```bash
+git clone -b scenario3 https://github.com/nora6633/prlab-zerotrust-infra.git
+cd prlab-zerotrust-infra
+```
+
+**Ansible, and the collections this repo's roles need:**
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ansible git python3-pip
+ansible-galaxy collection list | grep -i docker   # confirm community.docker is already present
+```
+
+The Ubuntu `ansible` apt package already bundles `community.docker` and `community.general` - the separate `ansible-galaxy collection install` step mentioned earlier in this doc is only needed if you installed a bare `ansible-core` via pip instead.
+
+**Docker CE + the Compose v2 plugin.** `bootstrap_scenario_hosts.yml` (and every service role) needs `docker compose` as a subcommand, not the standalone `docker-compose` binary - Ubuntu's own `docker.io` apt package does **not** include it.
+
+⚠️ **This removes `docker.io`/`docker-compose`/`containerd`/`runc` first - only do this on a genuinely fresh machine/VM.** If the host already has containers or data you need to keep, don't paste this blindly; adapt it (or install Docker CE alongside what's there) instead.
+
+```bash
+sudo apt-get remove -y docker.io docker-doc docker-compose podman-docker containerd runc
+sudo apt-get install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker "$USER"
+# The group change above doesn't apply to your current shell/session - log
+# out and back in, or run `newgrp docker`, before `docker`/`docker compose`
+# work without `sudo`.
+docker compose version   # should print a version, not "unknown command: compose"
+```
+
+⚠️ Switching from `docker.io` to `docker-ce` like this can leave `dockerd` in a crash-restart loop for a few seconds (`systemctl status docker` shows `Start request repeated too quickly`), apparently from a stale `iptables` lock held by the just-removed daemon. If `docker compose version` above fails to connect to the daemon, this clears it:
+
+```bash
+sudo pkill -9 dockerd
+sudo systemctl reset-failed docker
+sudo systemctl start docker
+```
+
 ### Single machine simulating 3 hosts vs. 3 real hosts
 
 The Architecture diagram above describes 3 logically separate hosts (External/SOC/LAN). Nothing about the roles themselves requires that — `site.yml` just targets whatever `inventory/hosts.ini` groups resolve to. In practice this lab is commonly run **on a single physical machine**, with each "host" actually being a separate Docker container/bridge network on that one machine, and `inventory/hosts.ini`'s `ansible_host` values pointing at those containers' bridge IPs rather than separate real machines. If that's your setup:
 
 - The `soc` group's `ansible_host` is the Docker host's own address (same machine Ansible runs on), with `ansible_connection=local`.
 - `external`/`lan` point at container IPs on their own bridge networks, not separate VMs.
-- **`dmz-ubuntu/` and `ubuntu-lan/` (their Dockerfile + `docker-compose.yaml`) are not deployed by `site.yml` or any other role in this repo** — if you're using these containers as stand-ins for the external/LAN hosts, the full order for a from-scratch scenario-3 deployment is:
+- **`dmz-ubuntu/` and `ubuntu-lan/` (their Dockerfile + `docker-compose.yaml`) are not deployed by `site.yml` or any other role in this repo** — if you're using these containers as stand-ins for the external/LAN hosts, prepare the following *before* running anything:
+
+  **`group_vars/soc.yml` and `inventory/hosts.ini` ship with the maintainer's own real environment's values, not a blank template.** `git clone` copies whatever is currently committed - both files are tracked (not gitignored), and on the maintainer's own machine they're additionally marked `git update-index --skip-worktree`, which only suppresses `git status`/`git diff` noise *on that one machine* and has no effect at all on what a fresh clone receives. If you're cloning this fresh, you will get the maintainer's own hostnames/IPs/credentials, not an empty form - overwrite both files with your own values before doing anything else:
+
+  ```bash
+  cp group_vars/soc.yml.example group_vars/soc.yml
+  cp inventory/hosts.ini.example inventory/hosts.ini
+  # Optional, but recommended if you intend to keep working in this clone and
+  # don't want your own real values to accidentally get committed later:
+  git update-index --skip-worktree group_vars/soc.yml inventory/hosts.ini
+  ```
+
+  See [§ Change secrets](#2-change-secrets) below for which `soc.yml` values need a real value before first deploy vs. which are fine to leave as-is.
+
+  `dmz-ubuntu/Dockerfile` and `ubuntu-lan/Dockerfile` both `COPY` an `authorized_keys` file at build time - it's gitignored, so a fresh clone doesn't have one and the image build fails outright without it. This generates an ed25519 keypair, **not** the RSA key `hosts.ini.example`'s `ansible_ssh_private_key_file` points at by default - update that line in your `hosts.ini` to match (done below), rather than generating an RSA key just to match the example file:
+
+  ```bash
+  ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+  cp ~/.ssh/id_ed25519.pub dmz-ubuntu/authorized_keys
+  cp ~/.ssh/id_ed25519.pub ubuntu-lan/authorized_keys
+  ```
+
+  Ansible's own SSH connections to these containers will fail on first contact (`Host key verification failed`) unless `hosts.ini`'s `[all:vars]` sets this (matching what `insider-threat-test/run_attack.sh` already assumes), and `ansible_ssh_private_key_file` must point at the key you just generated above, not `hosts.ini.example`'s default `~/.ssh/id_rsa`:
+
+  ```ini
+  [all:vars]
+  ansible_ssh_private_key_file=~/.ssh/id_ed25519
+  ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+  ```
+
+  With that done, the full order for a from-scratch scenario-3 deployment is:
   ```bash
   # 1. Fill in group_vars/soc.yml FIRST (see group_vars/soc.yml.example) - every
   #    CHANGE_ME must be replaced before running configure_integration.yml, or
@@ -195,6 +273,8 @@ Then use the dynamic inventory script for all playbook commands:
 ansible-playbook -i inventory/hosts.py site.yml
 ```
 
+`ANSIBLE_SSH_KEY` only feeds `inventory/hosts.py` (confirmed in that script - its default really is `~/.ssh/id_rsa`, not a doc error). It has **no effect** on the single-machine/scenario-3 path below ("Fresh host/VM setup" + "Single machine simulating 3 hosts"), which uses `-i inventory/hosts.ini` directly throughout - that path's own key comes from `hosts.ini`'s `ansible_ssh_private_key_file` instead (set to `~/.ssh/id_ed25519` there, matching the keypair generated in that section). It also has no effect on `insider-threat-test/run_attack.sh`, which uses a third, separate keypair of its own (`secrets/insider_threat_test_key`, auto-generated idempotently by the `insider_threat_agent_linux` role - nothing to set up manually). If you *are* using Option A's dynamic inventory with an ed25519 key instead of RSA, set `ANSIBLE_SSH_KEY=~/.ssh/id_ed25519` to match.
+
 **Option B — static file:**
 
 Edit `inventory/hosts.ini` directly and use `-i inventory/hosts.ini`.
@@ -218,7 +298,7 @@ None of `soc.yml`'s ~28 variables have an Ansible-level default (no `defaults/ma
 | `iris_secret_key` | Flask secret key (min 32 chars) |
 | `iris_db_password`, `iris_rabbitmq_user` / `iris_rabbitmq_password` | IRIS's own Postgres/RabbitMQ credentials |
 
-⚠️ **`wazuh_api_user` / `wazuh_api_password` are the one pair that looks like the above but ISN'T - do not change these from the `.example` defaults.** `roles/wazuh_server/templates/wazuh.yml.j2` hardcodes the Wazuh dashboard's `wazuh-wui` API credential as a literal string (it's Wazuh's own upstream `wazuh-docker` single-node default, cloned verbatim by `roles/wazuh_server/tasks/main.yml` - nothing in this repo sets it from `soc.yml`). But the DDoS/USB-DLP/insider-threat Shuffle workflows *do* build their Basic Auth header for calling the Wazuh API from `soc.yml`'s `wazuh_api_user`/`wazuh_api_password`. If you "secure" these per the usual instinct, every Active Response dispatch in those three workflows silently starts failing auth against the real manager, because nothing changed the manager's actual password to match. Leave these as the `.example` values. The same is suspected for `wazuh_indexer_user`/`wazuh_indexer_password` (same lack of any template that sets them from `soc.yml`), but that one isn't confirmed by a found hardcoded-template the way the API password is - treat it the same way (leave as `.example`) until proven otherwise.
+⚠️ **`wazuh_api_user` / `wazuh_api_password` and `wazuh_indexer_user` / `wazuh_indexer_password` are two pairs that look like the above but AREN'T - do not change these from the `.example` values, which are deliberately filled in with the matching upstream defaults, not `CHANGE_ME`.** `roles/wazuh_server/templates/wazuh.yml.j2` hardcodes the Wazuh dashboard's `wazuh-wui` API credential as a literal string (confirmed: Wazuh's own upstream `wazuh-docker` single-node default), and that same project's `docker-compose.yml` (cloned verbatim by `roles/wazuh_server/tasks/main.yml`) separately hardcodes its own `INDEXER_PASSWORD` the same way - neither is actually set from `soc.yml`, despite both having an entry here. But the DDoS/USB-DLP/insider-threat Shuffle workflows *do* build their Basic Auth headers for calling the Wazuh API and indexer from `soc.yml`'s copies of these four values. If you "secure" these per the usual instinct, every Active Response dispatch and indexer history lookup in those workflows silently starts failing auth against the real manager/indexer, because nothing changed the manager's/indexer's actual password to match. Leave these as the `.example` values - if you do need to rotate them for a non-lab deployment, change the hardcoded copy in `wazuh.yml.j2` (and the upstream `wazuh-docker` compose for the indexer one) at the same time, not just here.
 
 **Fine to leave as the `.example` placeholder, no known functional impact either way:**
 
@@ -246,7 +326,18 @@ Also review `group_vars/lan.yml` for FreeIPA, Nextcloud, and Mailcow passwords.
 
 Optionally change the domain (default `example.lab`) in `group_vars/all.yml`.
 
-> ⚠️ **Do not run `site.yml` against a machine that already has a working deployment on it using a *different* `soc.yml` than what's currently live.** `docker compose up -d` (used by every service role here) recreates any container whose rendered config changed - if your `soc.yml` differs from what the running containers were last deployed with, this will restart Wazuh/Shuffle/IRIS etc. with new credentials that may not match what's already inside their databases/volumes. This hasn't been tested end-to-end in this repo (no `--force-recreate` or `-v` flags are used, so it shouldn't delete volumes outright) - treat this as a reasoned risk from reading the roles, not a confirmed-safe-or-unsafe operation either way.
+> ⚠️ **Do not run `site.yml` against a machine that already has a working deployment on it using a *different* `soc.yml` than what's currently live.** `docker compose up -d` (used by every service role here) recreates any container whose rendered config changed - if your `soc.yml` differs from what the running containers were last deployed with, this will restart Wazuh/Shuffle/IRIS etc. with new credentials that may not match what's already inside their databases/volumes. **Confirmed live, not just a theoretical risk**: changing `iris_db_password` in `soc.yml` and re-running `site.yml` after DFIR-IRIS had already initialized with the old value recreated `iriswebapp_app`/`iriswebapp_worker` with the new password, while Postgres (a stateful service - its own init scripts only run once, against an empty data directory) kept the old one - every subsequent app connection failed with `password authentication failed for user "iris"` until the affected volume was removed and the service reinitialized from scratch. No `--force-recreate`/`-v` flags are used, so this does not delete a volume outright by itself - but a credential mismatch like this makes the existing data inaccessible through the app layer just the same, which is practically no better.
+>
+> This can happen to **any** of these services' own stateful data, not just IRIS's Postgres - each one's first-boot init is a one-time event, and a container recreate afterward only changes what the *new* container's env vars say, never what's already stored inside the volume:
+>
+> | Service | Volume | Driven by (in `soc.yml`) |
+> |---|---|---|
+> | DFIR-IRIS Postgres | `dfir-iris_iris-db-data` | `iris_db_password`, `iris_admin_password`, `iris_secret_key` |
+> | DFIR-IRIS RabbitMQ | `dfir-iris_iris-rabbitmq-data` | `iris_rabbitmq_password` |
+> | Shuffle (admin user + API key, stored in its OpenSearch backing store) | `shuffle_shuffle-opensearch-data` | `shuffle_admin_password`, `shuffle_default_apikey` |
+> | Wazuh indexer | `single-node_wazuh-indexer-data` | *not* driven by `soc.yml`'s `wazuh_indexer_password` at all - the upstream `wazuh-docker` compose hardcodes its own value, see the note on `wazuh_api_password`/`wazuh_indexer_password` above |
+>
+> If you need to change one of these values after the first deploy, remove that specific volume (`docker compose down` the relevant stack first, then `docker volume rm <name>`, **not** `-v` on the whole stack, which would take out volumes you didn't mean to touch) and re-run `site.yml` to let it reinitialize clean.
 
 ### 3. Deploy all services
 
@@ -273,6 +364,33 @@ ansible-playbook -i inventory/hosts.ini deploy_soc_remaining.yml
 ```
 
 > No Ansible at all on the Windows side? Run `windows-dmz/setup-dmz.ps1` directly on the DMZ host as Administrator — it does the same install via Chocolatey + Docker Desktop.
+
+**Docker Hub / ghcr.io pull failures.** The `soc` play alone pulls several multi-GB images (Wazuh manager/indexer/dashboard, Shuffle frontend/backend/orborus + OpenSearch, DFIR-IRIS app/nginx/db + RabbitMQ). On a slow or flaky connection, `docker compose up -d` inside these roles can fail partway through with `read: connection reset by peer` - confirmed to be general network/registry flakiness, not something these roles do wrong (retrying the same `ansible-playbook` command resumes from already-pulled layers, since neither Docker nor these roles delete a partial pull). Three ways to deal with it, roughly in order of effort:
+
+1. **Just retry.** Re-run the same `ansible-playbook -i inventory/hosts.ini site.yml` command. Layers already fully downloaded are not re-fetched.
+2. **Pre-pull before running Ansible at all**, so the whole multi-image pull isn't riding on one `docker compose up -d` call's retry budget (cross-checked against `roles/*/templates/docker-compose.yml.j2` and the upstream `wazuh-docker` compose - registry/name/tag below are exact):
+   ```bash
+   docker pull wazuh/wazuh-manager:4.9.2
+   docker pull wazuh/wazuh-indexer:4.9.2
+   docker pull wazuh/wazuh-dashboard:4.9.2
+   docker pull ghcr.io/shuffle/shuffle-frontend:latest
+   docker pull ghcr.io/shuffle/shuffle-backend:latest
+   docker pull ghcr.io/shuffle/shuffle-orborus:latest
+   docker pull opensearchproject/opensearch:2.12.0
+   docker pull ghcr.io/dfir-iris/iriswebapp_app:v2.4.18   # both iriswebapp_app AND iriswebapp_worker use this same image, just a different command: - no separate pull needed for the worker
+   docker pull ghcr.io/dfir-iris/iriswebapp_nginx:v2.4.18
+   docker pull ghcr.io/dfir-iris/iriswebapp_db:v2.4.18    # DFIR-IRIS's own Postgres image, not a vanilla postgres:xx
+   docker pull rabbitmq:3-management                      # the plain upstream Docker Hub image, not ghcr.io-hosted
+   ```
+   ⚠️ The three `ghcr.io/shuffle/*:latest` images are **not version-pinned** - whatever you pull here may not match the exact build this doc was last verified against. If something Shuffle-related behaves differently than described elsewhere in this README, check `docker image inspect <image> --format '{{.Created}}'` before assuming it's a bug in these roles.
+3. **Pull on a machine with a working connection, then import on the target** (what was actually necessary in testing, when the pulling machine's own network was the bottleneck - not specific to any of these images or to Docker/Ansible):
+   ```bash
+   # On the machine that CAN reach the registry:
+   docker save -o wazuh-manager.tar wazuh/wazuh-manager:4.9.2
+   # ...repeat per image, then copy the .tar file(s) to the target host, then:
+   docker load -i wazuh-manager.tar
+   ```
+   Confirm the loaded image's ID matches the source machine's (`docker image inspect <image> --format '{{.Id}}'`) before trusting it's the exact same build.
 
 ### 4. Wire up the alert pipeline
 
