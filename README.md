@@ -1,5 +1,7 @@
 # SOC Lab Infrastructure
 
+> Scenario 3 (insider-threat, `insider-threat-test/`) lives on the `scenario3` branch, not `main`. Clone with `git clone -b scenario3 <repo>` if you need it.
+
 Ansible-orchestrated, Docker Compose-based SOC lab across three hosts. Fill in three IP addresses, run two playbooks, and all services are deployed and wired together automatically.
 
 ---
