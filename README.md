@@ -5,34 +5,9 @@ Ansible-orchestrated, Docker Compose-based SOC lab across three hosts. Fill in t
 ---
 
 ## Architecture
-<img width="2252" height="844" alt="image" src="https://github.com/user-attachments/assets/16eac631-446d-48bb-85fc-bcee39264b8a" />
+<img width="370" height="360" alt="image" src="https://github.com/user-attachments/assets/ad2f48ac-ea0f-42cb-b4af-1ef3b634f128" />
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ External Host  (Linux OR Windows DMZ)                           │
-│   • OWASP Juice Shop  (port 3000)  — intentionally vulnerable   │
-│   • Wazuh Agent       (host mode)  — monitors this host         │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │ agent registration / alerts
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ SOC Host                                                        │
-│   • Wazuh Server   (port 443)   — SIEM / EDR                   │
-│     └─ on alert (level ≥ 7) → custom-shuffle.py                │
-│   • Shuffle        (port 3001)  — SOAR                          │
-│     └─ webhook → HTTP POST to DFIR-IRIS API                     │
-│   • DFIR-IRIS      (port 4444)  — case management               │
-└─────────────────────────────────────────────────────────────────┘
-                               ▲ agent registration / alerts
-                               │
-┌─────────────────────────────────────────────────────────────────┐
-│ LAN Host                                                        │
-│   • FreeIPA    (port 8443)  — LDAP / Kerberos identity          │
-│   • Nextcloud  (port 8888)  — file storage                      │
-│   • Mailcow    (port 443)   — mail server suite                 │
-│   • Wazuh Agent (host mode) — monitors this host                │
-└─────────────────────────────────────────────────────────────────┘
-```
+
 
 ### Alert Pipeline
 
