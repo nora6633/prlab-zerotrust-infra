@@ -21,23 +21,36 @@
     # CHANGE_ME here gets baked into a live, hard-to-detect broken system
     # instead of failing loudly up front. dmz_windows_agent_id is
     # deliberately NOT checked - a topology with no Windows DMZ host
-    # legitimately has no value to put there. ──────────────────────────────
-    - name: Fail fast if required credentials/identifiers are still placeholders
+    # legitimately has no value to put there. Checked individually (one
+    # assert per variable via loop, not one big combined assert) so the
+    # fail_msg names the exact offending variable instead of listing every
+    # candidate and leaving the reader to guess which one is actually bad. ──
+    - name: "Fail fast if a required credential/identifier is still a placeholder: {{ item.name }}"
       assert:
         that:
-          - wazuh_indexer_password != "CHANGE_ME" and (wazuh_indexer_password | length > 0)
-          - wazuh_api_password != "CHANGE_ME" and (wazuh_api_password | length > 0)
-          - wazuh_server_ip | length > 0
-          - dmz_ubuntu_agent_id != "CHANGE_ME" and (dmz_ubuntu_agent_id | length > 0)
-          - iris_adm_api_key != "CHANGE_ME" and (iris_adm_api_key | length > 0)
-          - abuseipdb_api_key != "CHANGE_ME" and (abuseipdb_api_key | length > 0)
+          - item.value != "CHANGE_ME"
+          - item.value | length > 0
         fail_msg: >-
-          One or more group_vars/soc.yml values this playbook bakes into a
-          Shuffle workflow or custom-shuffle.py are still "CHANGE_ME" or
-          empty: check wazuh_indexer_password, wazuh_api_password,
-          wazuh_server_ip, dmz_ubuntu_agent_id, iris_adm_api_key, and
-          abuseipdb_api_key. Fix the offending variable(s) in
-          group_vars/soc.yml before running this playbook.
+          group_vars/soc.yml: {{ item.name }} is still "CHANGE_ME" or empty.
+          {{ item.hint }} Fix this in group_vars/soc.yml before running this
+          playbook.
+      loop:
+        - { name: "wazuh_indexer_password", value: "{{ wazuh_indexer_password }}", hint: "This must match the upstream wazuh-docker project's INDEXER_PASSWORD - see the Change secrets section of README.md." }
+        - { name: "wazuh_api_password", value: "{{ wazuh_api_password }}", hint: "This must match the password hardcoded in roles/wazuh_server/templates/wazuh.yml.j2 - see the Change secrets section of README.md." }
+        - { name: "dmz_ubuntu_agent_id", value: "{{ dmz_ubuntu_agent_id }}", hint: "Look this up with: docker exec single-node-wazuh.manager-1 /var/ossec/bin/agent_control -l" }
+        - { name: "iris_adm_api_key", value: "{{ iris_adm_api_key }}", hint: "Choose a real value before first deploy - DFIR-IRIS adopts it as its actual admin API key at container boot." }
+        - { name: "abuseipdb_api_key", value: "{{ abuseipdb_api_key }}", hint: "Only used by the DDoS workflow's AbuseIPDB lookup node, imported unconditionally by this playbook regardless of which scenario you actually want - a placeholder string is fine here if you are not using the DDoS scenario (get a free real key at https://www.abuseipdb.com/account/api if you are)." }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Fail fast if wazuh_server_ip is empty (derived automatically from inventory/hosts.ini, not a CHANGE_ME-style placeholder)
+      assert:
+        that:
+          - wazuh_server_ip | length > 0
+        fail_msg: >-
+          group_vars/all.yml derives wazuh_server_ip from inventory/hosts.ini's
+          soc-host ansible_host, but it came back empty - check that
+          inventory/hosts.ini has a real value there.
 
     # ── Shuffle: import workflow ──────────────────────────────────────────
     - name: Ensure Shuffle backend is reachable

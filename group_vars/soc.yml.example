@@ -88,9 +88,13 @@ soc_notify_email: "soc@example.lab"
 # ── DFIR-IRIS ──────────────────────────────────────────────────────────────
 iris_version: "v2.4.18"
 iris_admin_password: "CHANGE_ME"
-# Set this AFTER first running configure_integration.yml and generating an
-# API key from the IRIS UI (Advanced -> API keys) - used by Shuffle to call
-# the IRIS API.
+# Choose a real value BEFORE first deploy, same as iris_admin_password above -
+# roles/dfir_iris/templates/docker-compose.yml.j2 passes this straight through
+# as the IRIS_ADM_API_KEY container env var, so IRIS adopts whatever string is
+# here as its actual admin API key at container boot. It is NOT something you
+# generate from the IRIS UI afterward and copy back - by the time the
+# container is up, this value is already live. Also embedded into the Shuffle
+# workflow at import time so Shuffle can call the IRIS API.
 iris_adm_api_key: "CHANGE_ME"
 iris_db_password: "CHANGE_ME"
 iris_rabbitmq_user: iris
