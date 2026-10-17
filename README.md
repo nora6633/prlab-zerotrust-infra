@@ -104,10 +104,12 @@ Wazuh Manager
 
 | | Scenario 3 only (`--limit soc-host,dmz-ubuntu`) | Full deploy (incl. `lan` play) |
 |---|---|---|
-| RAM | **Measured** ≈7.4 GiB (`docker stats` summed across SOC containers + `dmz-ubuntu` + the `lan` container's own base footprint). Whole-VM `free -h` at the same snapshot (19GiB VM): 6.1 GiB used. | **Not measured** (Nextcloud/Mailcow/FreeIPA never reached a stable fully-up state together to snapshot — see FreeIPA note below). The 3-hosts table above's LAN-host figure (4GB min / 8GB recommended) is the closest reference, not re-verified for this topology. |
-| Disk | **Estimated** ≈20-29GB (outer images ~15.1GB + outer volumes 11.74GB, most of which is likely inflated by repeated testing and not representative of a fresh deploy (unverified) + non-`lan` container layers ~2.5GB) — arithmetic on measured components, not a from-scratch test. | **No usable number** — this test VM's disk hit 100% (96GB/96GB), but ~60GB of that traced to a specific bug (see FreeIPA note below), not representative steady-state usage. Budget generously and monitor if you run this play. |
+| RAM | **Measured** 6.2 GiB (whole-VM `free -h` used, on a 19GiB test VM) — SOC containers + `dmz-ubuntu` + an empty `lan` container (no FreeIPA/Nextcloud/Mailcow actually running in it). A separate measurement run's `docker stats` summed across the same containers gave ≈7.4 GiB — same ballpark, not identical since it's a different aggregation method. | **Not measured** — Nextcloud/Mailcow/FreeIPA never reached a stable fully-up state together to snapshot, because FreeIPA itself never reaches a stable running state at all (see the FreeIPA note below). The 3-hosts table above's LAN-host figure (4GB min / 8GB recommended) is the closest reference, not re-verified for this topology. |
+| Disk | **Measured** 33GB (`df -h /` used) under the same conditions as the RAM row above: scenario 3 path only, `lan` container present but empty — confirmed via `docker ps -s`, which reported its writable layer at 8.73MB at that point (`bootstrap_scenario_hosts.yml` + `deploy_insider_threat_response.yml`'s network play run, but never the `lan` play itself — no FreeIPA/Nextcloud/Mailcow data in it). `docker system df` breakdown at that point: Images 19.56GB, Containers 2.47GB, Volumes 6.07GB, Build cache 1.78GB. | **No safe number to give.** This test VM's disk hit 100% (96GB/96GB) during testing, traced almost entirely to `lan`'s own writable layer growing past ~60GB (see the FreeIPA note and the disk-full troubleshooting section below). The actual ceiling is unknown — 96GB wasn't enough on this run, so there's no verified "budget N GB and you're safe" number to give here. If disk is constrained, skip the `lan` play entirely (see above); if you do run it, watch `df -h /` continuously rather than relying on a fixed allowance. |
 
 Only a ~19GiB VM was actually tested — nothing smaller. 12GiB is a reasonable first value to try, not a verified minimum.
+
+A full disk causes three separate, independent failures that don't recover on their own (auditd stops logging, OpenSearch goes `red`, Shuffle's backend stops responding) — symptoms show up as Active Response never firing. See "**If the disk actually does fill up...**" further down this section for the recovery steps.
 
 ---
 
@@ -418,11 +420,40 @@ To actually skip it, add `--limit soc-host,dmz-ubuntu` to the real `ansible-play
 - `roles/mailcow/tasks/main.yml`'s `git clone` of `mailcow-dockerized` has **no pinned version** (no `version:`/tag/commit) — it tracks whatever that upstream project's default branch HEAD is at the moment you run it, so its own image list, versions, and behavior can all change out from under this repo without warning, and are not reproducible between two runs on different days.
 - FreeIPA is currently known to fail outright in this containerized environment (server-side install completes, but the image's own client-side `ipa-client-install` step fails with a Kerberos/SPNEGO error, root cause not identified). It loops `restart: unless-stopped` indefinitely. This is non-fatal to the rest of the play — `roles/freeipa/tasks/main.yml`'s own wait task is deliberately `failed_when: false` (up to ~15 minutes of retries) specifically so it doesn't block Nextcloud/Mailcow — but expect `site.yml` to sit through that wait if you include this play.
 
-  ⚠️ **This restart loop is not just a time cost — on a test VM it grew `lan`'s own container disk footprint to ~67GB.** Likely cause (reasoned from what was observed, not directly proven): `roles/common` sets nested Docker's storage driver to `vfs` (no layer deduplication), and each FreeIPA crash/restart cycle appears to leave behind a new, never-reclaimed ~0.9-1.4GB copy of its root filesystem — over a day of uptime, dozens of these accumulated to tens of GB. If you hit this, you can stop the loop:
+  ⚠️ **This restart loop is not just a time cost — on a test VM it grew `lan`'s own container disk footprint to ~60GB or more over about a day of uptime** (`docker ps -s` reported `lan`'s writable layer at 67.1GB; a direct `du` on the underlying overlay snapshot directory measured ~62-63GB for the same thing at roughly the same time — the two tools account for it slightly differently; treat both readings as the same finding, not a discrepancy). Likely cause (reasoned from what was observed, not directly proven): `roles/common` sets nested Docker's storage driver to `vfs` (no layer deduplication), and each FreeIPA crash/restart cycle appears to leave behind a new, never-reclaimed ~0.9-1.4GB copy of its root filesystem — over a day of uptime, dozens of these accumulated to tens of GB. If you hit this, you can stop the loop:
   ```bash
   docker exec lan docker stop freeipa
   ```
   This specific command and its effect were not re-verified live after the disk filled up (the same disk-full state blocks `docker exec` into `lan` at all). Reasoning from the role's own task definition rather than a live test: `roles/freeipa/tasks/main.yml` deploys via a plain `docker compose up -d` (no `--no-recreate`), so a stopped/`docker update --restart=no` container will likely get recreated — and the restart loop will resume — the next time `site.yml` or this role runs again, since compose will see the live config drift from `restart: unless-stopped` and reconcile it. Treat `docker stop`/`docker update --restart=no` as a temporary mitigation between runs, not a permanent fix.
+
+  ⚠️ **If the disk actually does fill up, three separate things break and none of them recover on their own once space is freed again** — confirmed live on a test VM after the growth above ran the disk to 100%:
+  - **Symptoms**: attack-simulation commands (`insider-threat-test/run_attack.sh`) run and complete normally, but Active Response never fires; Shuffle stops processing new executions entirely; `curl` to Shuffle's own API (port 5001) gets `connection refused`.
+  - **Quick checks**:
+    ```bash
+    df -h /                                              # is it actually full?
+    stat -c '%y' /var/log/audit/audit.log                # host auditd - last write time far in the past means it's not logging
+    docker exec shuffle-opensearch curl -s http://localhost:9200/_cluster/health   # look for "status":"red"
+    ```
+  - **auditd silently self-suspends on a full disk and does not resume on its own once space is freed.** This is the Ubuntu `auditd` package's own stock default (`disk_full_action = SUSPEND` in `/etc/audit/auditd.conf`) — this repo's `insider_threat_host_audit` role only installs the package and its detection rules, it never touches this setting. `systemctl status auditd` still shows `active (running)` throughout (the daemon doesn't crash, it just stops writing), which makes this easy to miss. This runs on the SOC host itself (`roles/insider_threat_host_audit` targets `hosts: soc`, `ansible_connection=local`), not inside `dmz-ubuntu` - auditd can't run inside a container at all (no kernel audit netlink access), which is exactly why it's installed on the host and `/var/log/audit` is bind-mounted read-only into `dmz-ubuntu` instead.
+  - **Fix, in this order** (OpenSearch and Shuffle first, since the disk filling in the first place is what breaks them; auditd last since it's independent of the other two):
+    ```bash
+    # 1. Clear OpenSearch's read-only block from the full-disk watermark, then
+    #    retry shard allocation (run on the VM/host, against the Shuffle OpenSearch container):
+    docker exec shuffle-opensearch curl -s -X PUT "http://localhost:9200/_all/_settings" \
+      -H "Content-Type: application/json" -d '{"index.blocks.read_only_allow_delete": null}'
+    docker exec shuffle-opensearch curl -s -X POST "http://localhost:9200/_cluster/reroute?retry_failed=true"
+    # Confirm status is "yellow" (not "red") before continuing - "yellow" with
+    # unassigned replica shards is normal for a single-node cluster.
+
+    # 2. Restart Shuffle's backend so it reconnects and starts accepting
+    #    requests on port 5001 again (run on the VM/host's outer Docker):
+    docker restart shuffle-backend
+
+    # 3. Restart auditd so it resumes writing (run on the VM/host itself, not
+    #    inside any container):
+    sudo systemctl restart auditd
+    ```
+  - **Prevention**: check available disk (`df -h /`) before starting a deploy, not just before running the optional `lan` play - all three of the above can be triggered by any source of disk pressure, not just FreeIPA's restart loop.
 
 **Windows DMZ external host?** Skip the `external` play in `site.yml` and run the dedicated Windows playbook instead — it installs Juice Shop as a Windows service via NSSM and the Wazuh agent via MSI, configures the firewall, and registers the agent with the manager:
 
