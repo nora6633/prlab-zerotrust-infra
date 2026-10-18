@@ -1,26 +1,34 @@
 ---
 # Scenario-3-only Shuffle/Wazuh integration wiring. Deliberately SEPARATE
-# from configure_integration.yml: that playbook re-POSTs all three existing
-# workflows (IRIS/DDoS/USB-DLP) unconditionally on every run, and Shuffle's
-# import API creates a new duplicate each time rather than updating in
-# place (confirmed live: 6-7 duplicates already accumulated per workflow
-# name, 86 orphaned hook documents in the "hooks" OpenSearch index). This
-# playbook does not touch any of that - it looks up the CURRENTLY ACTIVE
-# IRIS/DDoS/USB-DLP trigger IDs (same "newest by created" selection
-# custom-shuffle.py's actual deployed behavior already depends on -
-# verified stable across repeated calls and cross-checked against
+# from configure_integration.yml: that playbook used to re-POST all three
+# existing workflows (IRIS/DDoS/USB-DLP) unconditionally on every run, and
+# Shuffle's import API created a new duplicate each time rather than
+# updating in place (confirmed live: 6-7 duplicates had accumulated per
+# workflow name, 86 orphaned hook documents in the "hooks" OpenSearch
+# index, before this was fixed). configure_integration.yml is now also
+# idempotent (checks for an existing same-name workflow before importing),
+# but this playbook still exists as a separate, scenario-3-only entry
+# point and does not touch the IRIS/DDoS/USB-DLP workflows at all - it
+# looks up their CURRENTLY ACTIVE trigger IDs (same "newest by created"
+# selection custom-shuffle.py's actual deployed behavior already depends
+# on - verified stable across repeated calls and cross-checked against
 # `created` timestamps, not just list position) and only imports/registers
 # the new insider-threat workflow.
 #
-# Known separate issue (not fixed here, see the deviation list): the
-# existing IRIS/DDoS/USB-DLP workflows' own internal HTTP action nodes
+# The IRIS/DDoS/USB-DLP workflows' own internal HTTP action nodes
 # (wazuh_auth, wazuh_ar_block_*, wazuh_history, IRIS alert/case endpoints)
-# have the stale 192.168.5.15 IP baked into their stored JSON from import
-# time - re-rendering custom-shuffle.py here fixes the FORWARDING layer's
-# address, not those workflows' own internal node URLs. AUTO_BLOCK for
-# scenario 1/2 is likely non-functional until those three workflows are
-# re-imported with the current wazuh_server_ip - tracked separately, not
-# in scope for this playbook.
+# bake in wazuh_server_ip as a plain string at import time - Shuffle never
+# re-reads it from group_vars later, so if the SOC host's IP changes after
+# a workflow was imported, that workflow's own node URLs go stale until it
+# is deleted and re-imported (re-rendering custom-shuffle.py only fixes the
+# FORWARDING layer's address, not those nodes). Checked live on 2026-10-19:
+# the currently-active DDoS workflow's nodes already have the current
+# wazuh_server_ip (10.8.0.16) baked in, and a full live run of both DDoS
+# and USB-DLP (real traffic/file writes through to a real AUTO_BLOCK /
+# ESCALATE_AND_CONTAIN, including the Active Response call) confirmed both
+# scenarios work end to end - so this is not a live issue in this
+# environment right now, just something to watch for if wazuh_server_ip
+# changes again: re-import the affected workflow(s) after changing it.
 #
 # Usage:
 #   ansible-playbook -i inventory/hosts.ini configure_insider_threat_integration.yml

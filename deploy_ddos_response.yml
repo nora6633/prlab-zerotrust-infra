@@ -20,7 +20,7 @@
     - wazuh_ddos_rules
 
 - name: Deploy nginx + Active Response on Windows DMZ
-  hosts: external
+  hosts: dmz-windows
   gather_facts: false
   roles:
     - nginx_dmz_windows

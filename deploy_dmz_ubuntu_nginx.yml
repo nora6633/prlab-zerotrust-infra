@@ -97,6 +97,34 @@
         mode: '0750'
       notify: restart wazuh-agent
 
+    # ip-limit.sh self-manages its own per-srcip auto-release timer instead
+    # of relying on ar.conf's <timeout> (confirmed live: that native
+    # mechanism does not reliably fire for an API-dispatched, not
+    # rule-triggered, Active Response — same gap host-isolate.sh's own
+    # backstop wodle already works around, see
+    # roles/insider_threat_agent_linux/tasks/main.yml for the sibling
+    # registration). This wodle is the backstop for the case the detached
+    # sleeper itself dies (e.g. a wazuh-agent.service restart reaping it
+    # via KillMode=control-group) — --check-expiry is a silent no-op unless
+    # a deadline file exists AND has actually expired, so this 15s interval
+    # doesn't spam active-responses.log.
+    - name: Configure ip-limit auto-release backstop wodle (catches a dead setsid sleeper)
+      blockinfile:
+        path: /var/ossec/etc/ossec.conf
+        insertbefore: '</ossec_config>'
+        marker: "  <!-- {mark}: ip-limit block expiry wodle -->"
+        block: |
+              <wodle name="command">
+                <disabled>no</disabled>
+                <tag>ip-limit-expiry-check</tag>
+                <command>/var/ossec/active-response/bin/ip-limit.sh --check-expiry</command>
+                <interval>15s</interval>
+                <ignore_output>yes</ignore_output>
+                <run_on_start>yes</run_on_start>
+                <timeout>10</timeout>
+              </wodle>
+      notify: restart wazuh-agent
+
   handlers:
     - name: reload nginx
       systemd:
