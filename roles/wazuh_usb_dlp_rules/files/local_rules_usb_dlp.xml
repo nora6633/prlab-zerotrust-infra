@@ -1,0 +1,40 @@
+<!-- DLP: file-write detection on a simulated external/removable disk
+     (C:\SimulatedUSB on dmz-windows), monitored via Wazuh FIM (syscheck)
+     in realtime mode. Wazuh's FIM alerts are produced by an internal C
+     module (decoded_as syscheck_new_entry / syscheck_integrity_changed),
+     not the generic text-decoder pipeline, so this can't be validated
+     with wazuh-logtest the way the DDoS nginx rules were - verified live
+     instead by writing real files under C:\SimulatedUSB and confirming
+     rule 100500 fires in alerts.json (see README/deploy_usb_dlp_response.yml).
+
+     Division of labor mirrors the DDoS scenario exactly: Wazuh only
+     detects and tags the event here. All scoring (file size / extension /
+     time-of-day / 10-minute same-endpoint history) and the
+     ESCALATE_AND_CONTAIN / NOTIFY_SOC / LOG_ONLY decision happen in
+     Shuffle (roles/shuffle/files/usb_dlp_score_alert.py). No
+     <active-response> is bound to this rule - blocking write access to
+     the simulated drive happens exclusively via Shuffle calling the
+     Wazuh Active Response API after scoring (see inject_active_response.py.j2),
+     so a low-risk file write is never blocked by reflex. -->
+<group name="dlp,usb,file_write,">
+
+  <!-- ============================================================
+       100500: file written to the simulated external disk.
+       Chains off Wazuh's built-in FIM rules:
+         550 - "Integrity checksum changed" (existing file overwritten)
+         554 - "File added to the system" (new file created)
+       Scoped to C:\SimulatedUSB via the `file` field so this doesn't
+       also fire for Wazuh's other, unrelated default-monitored FIM
+       paths (Windows startup folder, System32, etc.) that share the
+       same base rules - those are NOT the simulated removable disk.
+       Level 7 clears wazuh_alert_min_level (group_vars/soc.yml) so
+       custom-shuffle's <integration> block actually receives it.
+       ============================================================ -->
+  <rule id="100500" level="7">
+    <if_sid>550,554</if_sid>
+    <field name="file" type="pcre2">(?i)^c:\\simulatedusb\\</field>
+    <description>DLP: file written to simulated removable disk: $(file)</description>
+    <mitre><id>T1052.001</id></mitre>
+  </rule>
+
+</group>

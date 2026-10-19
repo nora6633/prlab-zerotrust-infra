@@ -8,3 +8,38 @@ external_host_ip: "{{ hostvars[groups['external'][0]]['ansible_host'] }}"
 domain: example.lab
 deploy_base_dir: /opt/soc-infra
 wazuh_version: "4.9.2"
+
+# ── Scenario 3: insider threat ──────────────────────────────────────────────
+# UID range shared between roles/insider_threat_host_audit (the auditd
+# rule, on the real Docker host) and roles/insider_threat_agent_linux (the
+# test accounts, inside dmz-ubuntu) - must match or the host-side rule
+# won't tag the right accounts' execve.
+insider_threat_test_uid_min: 21001
+insider_threat_test_uid_max: 21003
+
+# Dedicated bridge network connecting dmz-ubuntu <-> lan-host just for this
+# scenario's lateral-movement step. dmz-ubuntu_default and ubuntu-lan_default
+# are separate, non-routed docker networks (confirmed: a cross-network
+# connection attempt just hangs in SYN_SENT) - this network is the fix.
+# NOT part of either container's original compose file, so `docker compose
+# down && up` on either one drops it; re-run deploy_insider_threat_response.yml
+# to reattach (see roles/insider_threat_network).
+insider_threat_link_network: scenario3-link
+insider_threat_link_subnet: "172.30.0.0/24"
+insider_threat_dmz_link_ip: "172.30.0.2"
+insider_threat_lan_link_ip: "172.30.0.3"
+
+# Test account identities, shared between roles/insider_threat_agent_linux
+# (creates these accounts with these exact UIDs) and configure_integration.yml
+# (builds the Shuffle scorer's UID_MAP + WHITELIST from this same list, so
+# there is exactly one place to update if the accounts ever change).
+insider_threat_accounts:
+  - { name: ubuntu,     uid: 21001, whitelist: false }
+  - { name: it.prlab,   uid: 21002, whitelist: true }
+  - { name: svc_backup, uid: 21003, whitelist: true }
+
+# Test-only V5 override, default off - see roles/shuffle/files/insider_threat_score.py.j2
+# for why this exists (A/B's AUTO_BLOCK outcome depends on the off-hours
+# bonus to clear the 80 threshold at all). Flip to true only for
+# acceptance-test runs, then back to false afterward.
+insider_threat_v5_force_off_hours: false

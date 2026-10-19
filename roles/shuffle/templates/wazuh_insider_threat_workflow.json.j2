@@ -1,0 +1,342 @@
+{
+  "id": "{{ shuffle_insider_threat_workflow_id }}",
+  "name": "Wazuh Insider-Threat Auto-Response",
+  "description": "Auditd-sourced rules 100400-100410 -> attack-chain progression depth (Wazuh indexer history query + LIS, replacing Splunk) -> V1/V2/V3/V5 score -> AUTO_BLOCK (>=80, host-isolate Active Response) / NOTIFY_SOC (50-79) / LOG_ONLY (<50).",
+  "tags": ["wazuh", "insider-threat", "soar", "active-response"],
+  "status": "running",
+  "workflow_variables": [],
+  "actions": [
+
+    {
+      "id": "alert_preprocessing",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "shuffle-tools",
+      "name": "execute_python",
+      "label": "alert_preprocessing",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "code",
+          "value": {{ insider_threat_preprocess_code | to_json }}
+        }
+      ],
+      "position": {"x": 300, "y": 250}
+    },
+
+    {
+      "id": "wazuh_history_query",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "POST",
+      "label": "wazuh_history_query",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "{{ wazuh_indexer_url }}/wazuh-alerts-*/_search"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Basic {{ (wazuh_indexer_user + ':' + wazuh_indexer_password) | b64encode }}\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"size\":200,\"sort\":[{\"@timestamp\":\"asc\"}],\"query\":{\"bool\":{\"filter\":[{\"term\":{\"data.audit.auid\":\"$alert_preprocessing.message.auid\"}},{\"term\":{\"agent.name\":\"$alert_preprocessing.message.agent_name\"}},{\"terms\":{\"rule.id\":[\"100400\",\"100402\",\"100403\",\"100405\",\"100406\",\"100407\",\"100408\"]}},{\"range\":{\"@timestamp\":{\"gte\":\"now-24h\"}}}]}}}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 600, "y": 250}
+    },
+
+    {
+      "id": "progression_calc",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "shuffle-tools",
+      "name": "execute_python",
+      "label": "progression_calc",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "code",
+          "value": {{ insider_threat_progression_code | to_json }}
+        }
+      ],
+      "position": {"x": 900, "y": 250}
+    },
+
+    {
+      "id": "score_alert",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "shuffle-tools",
+      "name": "execute_python",
+      "label": "score_alert",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "code",
+          "value": {{ insider_threat_score_code | to_json }}
+        }
+      ],
+      "position": {"x": 1200, "y": 250}
+    },
+
+    {
+      "id": "wazuh_auth",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "POST",
+      "label": "wazuh_auth",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:55000/security/user/authenticate?raw=true"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Basic {{ (wazuh_api_user + ':' + wazuh_api_password) | b64encode }}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 1500, "y": 150}
+    },
+
+    {
+      "id": "wazuh_ar_isolate_host",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "PUT",
+      "label": "wazuh_ar_isolate_host",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:55000/active-response?agents_list={{ dmz_ubuntu_agent_id }}&pretty=true"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Bearer $wazuh_auth.body\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"command\":\"host-isolate0\",\"arguments\":[\"isolate\"],\"alert\":{\"data\":{\"agent\":\"$score_alert.message.agent_name\"}}}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 1800, "y": 150}
+    },
+
+    {
+      "id": "escalate_iris_alert",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "POST",
+      "label": "escalate_iris_alert",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:4444/alerts/add"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Bearer {{ iris_adm_api_key }}\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"alert_title\":\"AUTO_BLOCK: host isolated - $score_alert.message.agent_name ($score_alert.message.subject)\",\"alert_description\":\"$score_alert.message.summary_text\\n\\n$score_alert.message.evidence_text\",\"alert_severity_id\":5,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$score_alert.message.timestamp\",\"alert_tags\":\"insider_threat,AUTO_BLOCK\"}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 2100, "y": 150}
+    },
+
+    {
+      "id": "notify_soc_review",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "POST",
+      "label": "notify_soc_review",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:4444/alerts/add"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Bearer {{ iris_adm_api_key }}\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"alert_title\":\"NOTIFY_SOC: review $score_alert.message.agent_name ($score_alert.message.subject)\",\"alert_description\":\"$score_alert.message.summary_text - manual triage required, no block applied.\\n\\n$score_alert.message.evidence_text\",\"alert_severity_id\":3,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$score_alert.message.timestamp\",\"alert_tags\":\"insider_threat,NOTIFY_SOC\"}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 1500, "y": 350}
+    },
+
+    {
+      "id": "iris_log_alert",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "POST",
+      "label": "iris_log_alert",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:4444/alerts/add"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Bearer {{ iris_adm_api_key }}\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"alert_title\":\"LOG_ONLY: $score_alert.message.agent_name ($score_alert.message.subject)\",\"alert_description\":\"$score_alert.message.summary_text - below NOTIFY_SOC threshold, logged for visibility only.\\n\\n$score_alert.message.evidence_text\",\"alert_severity_id\":1,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$score_alert.message.timestamp\",\"alert_tags\":\"insider_threat,LOG_ONLY\"}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 1500, "y": 550}
+    }
+
+  ],
+  "triggers": [
+    {
+      "app_name": "Shuffle Triggers",
+      "name": "Insider Threat Webhook",
+      "description": "Receives Wazuh insider-threat alerts (rule.id 100400-100410 - filtered by custom-shuffle integration, see custom-shuffle.py.j2)",
+      "id": "{{ shuffle_insider_threat_webhook_trigger_id }}",
+      "type": "WEBHOOK",
+      "status": "running",
+      "isStartNode": true,
+      "app_version": "1.0.0",
+      "parameters": [
+        {
+          "name": "info",
+          "value": "Receives Wazuh alerts via HTTP POST. Rule-ID filtering happens in custom-shuffle, not here."
+        }
+      ],
+      "position": {"x": 50, "y": 250}
+    }
+  ],
+  "branches": [
+
+    {
+      "id": "br-trigger-to-preprocess",
+      "source_id": "{{ shuffle_insider_threat_webhook_trigger_id }}",
+      "destination_id": "alert_preprocessing",
+      "label": ""
+    },
+    {
+      "id": "br-preprocess-to-history",
+      "source_id": "alert_preprocessing",
+      "destination_id": "wazuh_history_query",
+      "label": ""
+    },
+    {
+      "id": "br-history-to-progression",
+      "source_id": "wazuh_history_query",
+      "destination_id": "progression_calc",
+      "label": ""
+    },
+    {
+      "id": "br-progression-to-score",
+      "source_id": "progression_calc",
+      "destination_id": "score_alert",
+      "label": ""
+    },
+
+    {
+      "id": "br-score-to-wazuh-auth",
+      "source_id": "score_alert",
+      "destination_id": "wazuh_auth",
+      "label": "AUTO_BLOCK (score >= 80)",
+      "conditions": [
+        {
+          "source": {"name": "action", "value": "$score_alert"},
+          "destination": {"value": "\"action\": \"AUTO_BLOCK\""},
+          "condition": {"value": "contains"}
+        }
+      ]
+    },
+    {
+      "id": "br-wazuh-auth-to-ar",
+      "source_id": "wazuh_auth",
+      "destination_id": "wazuh_ar_isolate_host",
+      "label": ""
+    },
+    {
+      "id": "br-ar-to-escalate",
+      "source_id": "wazuh_ar_isolate_host",
+      "destination_id": "escalate_iris_alert",
+      "label": ""
+    },
+
+    {
+      "id": "br-score-to-notify",
+      "source_id": "score_alert",
+      "destination_id": "notify_soc_review",
+      "label": "NOTIFY_SOC (50-79)",
+      "conditions": [
+        {
+          "source": {"name": "action", "value": "$score_alert"},
+          "destination": {"value": "\"action\": \"NOTIFY_SOC\""},
+          "condition": {"value": "contains"}
+        }
+      ]
+    },
+
+    {
+      "id": "br-score-to-log",
+      "source_id": "score_alert",
+      "destination_id": "iris_log_alert",
+      "label": "LOG_ONLY (score < 50)",
+      "conditions": [
+        {
+          "source": {"name": "action", "value": "$score_alert"},
+          "destination": {"value": "\"action\": \"LOG_ONLY\""},
+          "condition": {"value": "contains"}
+        }
+      ]
+    }
+
+  ]
+}

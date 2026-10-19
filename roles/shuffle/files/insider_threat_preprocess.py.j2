@@ -1,0 +1,72 @@
+"""
+Node 1/4 - alert_preprocessing. Extracts the fields the rest of the
+insider-threat pipeline needs from the raw Wazuh alert.
+
+Fields read individually as $exec.<field> (not a whole-blob json.loads),
+same reasoning as ddos_score_alert.py / usb_dlp_score_alert.py: full_log
+contains JSON-escaped quotes that collide with Python's own string-literal
+escaping when the whole alert is substituted into one string literal.
+
+subject is built from data.audit.auid, not data.dstuser: dstuser is a
+PAM/sshd-login decoder field, never populated by the auditd SYSCALL
+records these rules match on (confirmed empty on every live alert
+captured during Phase 0 testing) - the original thesis design's
+dstuser-first fallback is dropped here since it would never fire in this
+environment; auid is the only identity source that actually exists.
+
+UID_MAP is injected by Ansible (see the .j2 wrapper) from
+insider_threat_accounts, not hardcoded - keeps it in sync with whatever
+UIDs the accounts were actually created with instead of drifting
+independently.
+"""
+import json
+
+agent_name = "$exec.agent.name"
+agent_id = "$exec.agent.id"
+auid = "$exec.data.audit.auid"
+rule_id = "$exec.rule.id"
+rule_level_raw = "$exec.rule.level"
+timestamp = "$exec.timestamp"
+
+try:
+    rule_level = int(str(rule_level_raw).strip())
+except (ValueError, TypeError):
+    rule_level = 0
+
+# Attack-chain stage map - which MITRE-mapped step each rule represents.
+# 100410 (composite APT fast-path) is intentionally absent: it's a
+# correlation result, not a stage of its own, and never appears as a
+# candidate event in the progression-depth reconstruction.
+ID_STAGE = {
+    "100400": 1, "100402": 1,   # Discovery
+    "100406": 2,                # Lateral Movement
+    "100407": 3,                # Collection
+    "100405": 4, "100403": 4,   # Command and Control
+    "100408": 5,                # Exfiltration
+}
+trigger_stage = ID_STAGE.get(str(rule_id).strip(), 0)
+
+auid_str = str(auid).strip()
+UID_MAP = {{ insider_threat_uid_map_json }}
+subject = UID_MAP.get(auid_str, "uid:" + auid_str)
+
+# hour is UTC (Wazuh emits timestamps in UTC) - V5 in score_alert converts
+# to Asia/Taipei local time, same TZ_OFFSET convention as usb_dlp_score_alert.py.
+try:
+    clean_ts = timestamp.split(".")[0] if "." in timestamp else timestamp
+    utc_hour = int(clean_ts.split("T")[1].split(":")[0])
+except (IndexError, ValueError):
+    utc_hour = -1
+
+out = {
+    "agent_name": agent_name,
+    "agent_id": agent_id,
+    "auid": auid_str,
+    "subject": subject,
+    "rule_id": str(rule_id).strip(),
+    "rule_level": rule_level,
+    "trigger_stage": trigger_stage,
+    "timestamp": timestamp,
+    "hour": utc_hour,
+}
+print(json.dumps(out, ensure_ascii=False))

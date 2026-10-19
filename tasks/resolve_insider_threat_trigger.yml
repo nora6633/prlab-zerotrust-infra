@@ -1,0 +1,37 @@
+---
+# Shared by configure_integration.yml and configure_insider_threat_integration.yml.
+#
+# Given an already-fetched shuffle_workflows_raw fact (the raw JSON string
+# from GET /api/v1/workflows, registered by whichever playbook includes this
+# file), looks up the insider-threat workflow's CURRENT id/trigger id if one
+# exists yet, and sets shuffle_insider_threat_actual_wf/_trig.
+#
+# If no "Wazuh Insider-Threat Auto-Response" workflow exists yet (scenario 3
+# never deployed on this host), both facts are left undefined - callers that
+# render custom-shuffle.py must fall through to group_vars/soc.yml's own
+# shuffle_insider_threat_webhook_trigger_id value instead (CHANGE_ME
+# pre-deploy, same as today's behavior; the correct deployed value if
+# scenario 3 was already configured by a previous run). Do NOT write that
+# fallback as
+# "{{ shuffle_insider_threat_actual_trig | default(shuffle_insider_threat_webhook_trigger_id) }}"
+# - referencing a vars: key inside its own default() is a self-reference
+# that Ansible's templating engine treats as a recursive loop, not a safe
+# "fall through to the outer-scope value" (confirmed live: RecursionError /
+# "recursive loop detected in template string"). Capture the group_vars
+# value under a DIFFERENT name first, then default() to that name instead -
+# see configure_integration.yml's "Capture group_vars' insider-threat
+# trigger id as a fallback" task + the following "Template custom-shuffle
+# integration script" task's shuffle_insider_threat_webhook_trigger_id line
+# for the actual working pattern.
+#
+# This exists because configure_integration.yml previously had NO knowledge
+# of the insider-threat trigger id at all - re-templating custom-shuffle.py
+# (which it does on every run, to pick up scenario 1/2 trigger id changes)
+# silently clobbered scenario 3's webhook wiring back to group_vars/soc.yml's
+# permanently-stale CHANGE_ME placeholder whenever it ran after
+# configure_insider_threat_integration.yml had already wired it correctly.
+- name: Look up the insider-threat workflow's current id/trigger id (if it exists yet)
+  set_fact:
+    shuffle_insider_threat_actual_wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Insider-Threat Auto-Response') | sort(attribute='created', reverse=true) | list | first).id }}"
+    shuffle_insider_threat_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Insider-Threat Auto-Response') | sort(attribute='created', reverse=true) | list | first).triggers[0].id }}"
+  when: (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Insider-Threat Auto-Response') | list | length) > 0

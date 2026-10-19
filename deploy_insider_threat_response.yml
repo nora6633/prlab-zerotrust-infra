@@ -1,0 +1,48 @@
+---
+# Steps:
+#   1. site.yml + deploy_windows_dmz.yml / deploy_dmz_ubuntu_nginx.yml already applied
+#      (dmz-ubuntu and lan-host both have a registered Wazuh agent).
+#   2. ansible-playbook -i inventory/hosts.ini deploy_insider_threat_response.yml
+#   3. ansible-playbook -i inventory/hosts.ini configure_insider_threat_integration.yml
+#      to wire up the Shuffle workflow + custom-shuffle.py routing.
+#      Do NOT use configure_integration.yml for this - that playbook's
+#      workflow-import call is unconditional (every run POSTs a new
+#      workflow; Shuffle's import API is not an upsert), which is exactly
+#      how the other three scenarios ended up with 6-7 duplicate workflows
+#      each. configure_insider_threat_integration.yml exists specifically
+#      to only import once and reuse the existing workflow on every
+#      subsequent run - see that file's own header comment.
+#
+# The "network" tagged play attaches the dedicated scenario3-link bridge
+# (see roles/insider_threat_network) and, on dmz-ubuntu, depends on a
+# docker-compose change that recreates the container (brief outage) - both
+# are gated on explicit approval of a presented diff and are safe to
+# --skip-tags network until that happens, PROVIDED dmz-ubuntu's own
+# docker-compose.yaml has not yet been edited to declare scenario3-link as
+# an external network - once it has, skipping this tag means `docker
+# compose up -d` on dmz-ubuntu will refuse to start the container at all
+# (network declared external but not found). Everything else here is
+# independently idempotent.
+
+- name: Configure insider-threat detection on Wazuh manager + host auditd
+  hosts: soc
+  become: true
+  gather_facts: true
+  roles:
+    - insider_threat_host_audit
+    - wazuh_insider_threat_rules
+
+- name: Attach scenario3 link network (lan-host side; dmz-ubuntu side is its own compose change)
+  hosts: soc
+  become: true
+  gather_facts: false
+  tags: [network]
+  roles:
+    - insider_threat_network
+
+- name: Deploy insider-threat test accounts + AR + packages on dmz-ubuntu
+  hosts: dmz-ubuntu
+  become: true
+  gather_facts: true
+  roles:
+    - insider_threat_agent_linux

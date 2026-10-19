@@ -1,0 +1,100 @@
+"""
+Node 4/4 - score_alert. Combines V1 (event severity), V2 (attack-chain
+progression, computed upstream by progression_calc), V3 (whitelist), and
+V5 (off-hours) into a final score and AUTO_BLOCK/NOTIFY_SOC/LOG_ONLY
+decision.
+
+V4 (external threat-intel / public-IP reputation) from the original
+thesis design is dropped entirely, not stubbed to 0: it was dead code even
+in the original Python (is_public_ip is never set by any upstream node in
+the original pipeline either), and every attacker/target IP in this lab is
+RFC1918 private, so it would never have fired regardless. Max score is
+therefore 40+30+20+10=100, not the original design's 110.
+
+WHITELIST is injected by Ansible from insider_threat_accounts (the same
+source of truth as the account-creation role), not hardcoded - an account
+flagged whitelist: true there is whitelisted here too, with no second
+place to keep in sync.
+
+Branch conditions downstream (wazuh_insider_threat_workflow.json.j2) match
+the exact `"action": "AUTO_BLOCK"` / `"NOTIFY_SOC"` / `"LOG_ONLY"`
+key-value substring against this node's whole output, never a bare
+decision-band word or a dot-path field extraction - same reasoning as
+ddos_score_alert.py / usb_dlp_score_alert.py (Shuffle's dot-path resolution
+on conditional branches is unreliable; the whole-value "contains" match is
+the only method confirmed to work live).
+"""
+import json
+
+ctx_raw = r"""$progression_calc.message"""
+try:
+    d = json.loads(ctx_raw, strict=False)
+except Exception:
+    d = {}
+
+WHITELIST = {{ insider_threat_whitelist_json }}
+TZ_OFFSET = 8
+# Test-only override (default false): A/B's AUTO_BLOCK outcome depends on
+# V5's off-hours +10 to clear the 80 threshold at all (25+30+20+0=75,
+# BELOW 80, without it) - report.txt's own table 22 assumes the test ran
+# off-hours. Forcing a specific testing time window isn't viable (it would
+# also force sub-scenario C into the same window, and C's own math already
+# stays safely under 50 even with V5+10 - see the deviation list), so this
+# flag instead makes the outcome deterministic regardless of wall-clock
+# time. Leave false for any run meant to reflect real event timestamps.
+FORCE_OFF_HOURS = {{ 'True' if insider_threat_v5_force_off_hours | default(false) else 'False' }}
+
+subject = d.get("subject", "")
+rule_level = int(d.get("rule_level", 0) or 0)
+v2 = int(d.get("v2_score", 0) or 0)
+utc_hour = int(d.get("hour", -1) or -1)
+evidence = list(d.get("v2_evidence", []))
+
+# ── V1 event severity (cap 40) ──────────────────────────────────────────
+if rule_level >= 12:
+    v1 = 40
+elif rule_level >= 10:
+    v1 = 25
+else:
+    v1 = 0
+evidence.append(f"[V1+{v1}] rule level {rule_level}")
+
+evidence.append(f"[V2+{v2}] attack-chain progression depth {d.get('progression_depth', '?')}")
+
+# ── V3 whitelist (cap 20) ────────────────────────────────────────────────
+in_whitelist = subject in WHITELIST
+v3 = 0 if in_whitelist else 20
+evidence.append(f"[V3+{v3}] {subject} " + ("whitelisted (routine ops account)" if in_whitelist else "not whitelisted"))
+
+# ── V5 off-hours (cap 10) ────────────────────────────────────────────────
+local_hour = (utc_hour + TZ_OFFSET) % 24 if utc_hour >= 0 else -1
+off_hours = (((0 <= local_hour < 8) or (18 <= local_hour <= 23)) if local_hour >= 0 else False) or FORCE_OFF_HOURS
+v5 = 10 if off_hours else 0
+evidence.append(f"[V5+{v5}] " + (f"off-hours (local {local_hour}:00)" if off_hours else f"business hours (local {local_hour}:00)"))
+
+score = v1 + v2 + v3 + v5
+
+if score >= 80:
+    action = "AUTO_BLOCK"
+elif score >= 50:
+    action = "NOTIFY_SOC"
+else:
+    action = "LOG_ONLY"
+
+out = dict(d)
+out.update({
+    "score": score,
+    "action": action,
+    "breakdown": {"V1": v1, "V2": v2, "V3": v3, "V5": v5},
+    "in_whitelist": in_whitelist,
+    "local_hour": local_hour,
+    "evidence": evidence,
+})
+out["evidence_text"] = " | ".join(evidence)
+out["path_text"] = " -> ".join(d.get("progression_path", []))
+out["summary_text"] = (
+    f"Subject {subject} advanced {d.get('progression_depth', '?')} attack-chain stage(s) "
+    f"({out['path_text']}) in 24h. Score {score} (V1={v1} V2={v2} V3={v3} V5={v5}). Decision: {action}."
+)
+
+print(json.dumps(out, ensure_ascii=False))

@@ -1,0 +1,142 @@
+---
+# Targets hosts: dmz-ubuntu. Packages here must be re-applied after any
+# container recreation (e.g. the bind-mount change) - nothing in this role
+# depends on state baked into the image, so a straight re-run restores it.
+#
+# dmz-ubuntu's docker-compose.yaml is NOT in this repo (host-local file,
+# see dmz-ubuntu/docker-compose.yaml) - the /var/log/audit:ro bind mount it
+# needs lives only there. Fail loudly and early if it's missing rather than
+# silently falling back to an empty/missing audit log, which would look
+# like "no insider-threat alerts ever fire" with no obvious cause.
+
+- name: Verify the host auditd log is actually bind-mounted (required, not optional)
+  stat:
+    path: /var/log/audit/audit.log
+  register: _insider_threat_auditlog_stat
+
+- name: Fail fast if /var/log/audit/audit.log is missing (compose bind mount not applied)
+  fail:
+    msg: >-
+      /var/log/audit/audit.log does not exist inside this container.
+      This role requires the host's /var/log/audit bind-mounted read-only
+      at the same path - add to dmz-ubuntu/docker-compose.yaml:
+        volumes:
+          - /var/log/audit:/var/log/audit:ro
+      then `docker compose up -d` to recreate the container, and re-run
+      roles/insider_threat_host_audit on the host first so the log exists
+      before dmz-ubuntu starts reading it.
+  when: not _insider_threat_auditlog_stat.stat.exists
+
+- name: Install attack-simulation + isolation tooling
+  apt:
+    name:
+      - nmap
+      - netcat-openbsd
+      - curl
+      - tar
+      - openssh-client
+      - conntrack
+      - iptables
+    state: present
+    update_cache: true
+
+- name: Ensure sshd is enabled and running
+  systemd:
+    name: ssh
+    enabled: true
+    state: started
+
+- name: Ensure the gitignored secrets directory exists (controller-local)
+  file:
+    path: "{{ insider_threat_ssh_key_path | dirname }}"
+    state: directory
+    mode: '0700'
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Generate insider-threat test SSH keypair (controller-local, gitignored)
+  community.crypto.openssh_keypair:
+    path: "{{ insider_threat_ssh_key_path }}"
+    type: ed25519
+    comment: insider-threat-test
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Create insider-threat test accounts
+  # groups: [] + append: false strips any supplementary groups the base
+  # image auto-grants by username convention (confirmed live: creating a
+  # user literally named "ubuntu" on this ubuntu:24.04 image silently
+  # joined sudo/adm/dialout/cdrom/floppy/audio/dip/video/plugdev - *not*
+  # something this task asked for). adm matters specifically: it's the
+  # host's /var/log/audit group owner (root:adm 640) - a member of adm
+  # inside the container would be able to read the bind-mounted audit log
+  # directly, which must stay visible only to the wazuh-agent (root).
+  user:
+    name: "{{ item.name }}"
+    uid: "{{ item.uid }}"
+    shell: /bin/bash
+    create_home: true
+    password: '!'
+    groups: []
+    append: false
+  loop: "{{ insider_threat_accounts }}"
+
+- name: Authorize the shared test keypair for each test account
+  ansible.posix.authorized_key:
+    user: "{{ item.name }}"
+    key: "{{ lookup('file', insider_threat_ssh_key_path + '.pub') }}"
+    state: present
+  loop: "{{ insider_threat_accounts }}"
+
+- name: Configure wazuh-agent to read host auditd log (bind-mounted read-only)
+  blockinfile:
+    path: /var/ossec/etc/ossec.conf
+    insertbefore: '</ossec_config>'
+    marker: "  <!-- {mark}: insider-threat auditd log -->"
+    block: |
+          <localfile>
+            <log_format>audit</log_format>
+            <location>/var/log/audit/audit.log</location>
+          </localfile>
+  notify: restart wazuh-agent
+
+- name: Deploy host-isolate Active Response script
+  template:
+    src: host-isolate.sh.j2
+    dest: /var/ossec/active-response/bin/host-isolate.sh
+    owner: root
+    group: wazuh
+    mode: '0750'
+  notify: restart wazuh-agent
+
+# Second, independent auto-release backstop alongside the setsid sleeper
+# spawned by host-isolate.sh's apply_isolation() - specifically covers the
+# case where that sleeper dies before its sleep completes (setsid detaches
+# the *session* but not the *cgroup*, so a `systemctl restart wazuh-agent`
+# mid-isolation can still reap it via KillMode=control-group). Purely
+# local to this agent's own ossec.conf, not a manager-pushed remote
+# command, so it needs no remote_commands/wazuh_command enablement.
+# --check-expiry is a no-op (no log output at all) unless the deadline
+# file both exists and has actually expired - keeps this 30s-interval
+# wodle from spamming active-responses.log.
+- name: Configure auto-release backstop wodle (catches a dead setsid sleeper)
+  blockinfile:
+    path: /var/ossec/etc/ossec.conf
+    insertbefore: '</ossec_config>'
+    marker: "  <!-- {mark}: insider-threat isolation expiry wodle -->"
+    block: |
+          <wodle name="command">
+            <disabled>no</disabled>
+            <tag>host-isolate-expiry-check</tag>
+            <command>/var/ossec/active-response/bin/host-isolate.sh --check-expiry</command>
+            <interval>15s</interval>
+            <ignore_output>yes</ignore_output>
+            <run_on_start>yes</run_on_start>
+            <timeout>10</timeout>
+          </wodle>
+  notify: restart wazuh-agent
+
+- name: Flush handlers so agent is reading the audit log before verification
+  meta: flush_handlers

@@ -18,3 +18,9 @@ __pycache__/
 
 # ddos-attacker run_attack.sh state — tracks last-used source IP octet
 ddos-attacker/.last_ip_octet
+docs/
+*.pdf
+*.swp
+
+# insider-threat scenario — Ansible-generated SSH test keypair, never commit
+secrets/

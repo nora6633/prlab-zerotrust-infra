@@ -9,8 +9,22 @@ services:
     tmpfs:
       - /run
       - /run/lock
+    volumes:
+      - /var/log/audit:/var/log/audit:ro
+    networks:
+      default:
+        ipv4_address: 172.23.0.2
+      scenario3-link:
+        ipv4_address: 172.30.0.2
     ports:
       - "3010:3000"
       - "81:80"
     environment:
       - TZ=Asia/Taipei
+
+networks:
+  default:
+    name: dmz-ubuntu_default
+    external: true
+  scenario3-link:
+    external: true

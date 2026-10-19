@@ -5,13 +5,61 @@
     state: directory
     mode: '0755'
 
+- name: Create DFIR-IRIS certificates directory
+  file:
+    path: "{{ deploy_base_dir }}/dfir-iris/certificates"
+    state: directory
+    mode: '0755'
+
+- name: Generate self-signed certificate for DFIR-IRIS nginx
+  command:
+    cmd: >
+      openssl req -x509 -nodes -newkey rsa:2048
+      -keyout {{ deploy_base_dir }}/dfir-iris/certificates/iris.key
+      -out {{ deploy_base_dir }}/dfir-iris/certificates/iris.crt
+      -days 3650
+      -subj "/CN=iris.{{ domain }}/O=SOC Lab/C=TW"
+  args:
+    creates: "{{ deploy_base_dir }}/dfir-iris/certificates/iris.crt"
+
+- name: Restrict permissions on DFIR-IRIS private key (readable only by nginx image's www-data UID)
+  file:
+    path: "{{ deploy_base_dir }}/dfir-iris/certificates/iris.key"
+    owner: '33'
+    mode: '0600'
+
+- name: Set permissions on DFIR-IRIS certificate
+  file:
+    path: "{{ deploy_base_dir }}/dfir-iris/certificates/iris.crt"
+    mode: '0644'
+
 - name: Template DFIR-IRIS docker-compose
   template:
     src: docker-compose.yml.j2
     dest: "{{ deploy_base_dir }}/dfir-iris/docker-compose.yml"
     mode: '0644'
 
-- name: Deploy DFIR-IRIS stack
+- name: Start DFIR-IRIS database and message broker
+  command:
+    cmd: docker compose up -d iriswebapp_db iriswebapp_rabbitmq
+    chdir: "{{ deploy_base_dir }}/dfir-iris"
+
+- name: Wait for DFIR-IRIS database to accept connections
+  command:
+    cmd: docker exec iriswebapp_db pg_isready -U iris -d iris_db
+  register: iris_db_ready
+  until: iris_db_ready.rc == 0
+  retries: 30
+  delay: 2
+  changed_when: false
+
+- name: Ensure pgcrypto extension exists in iris_db (works around a bug in the vendor's own 10-create_user.sh init script, which connects via "psql --username iris" with no --dbname and so implicitly targets a nonexistent "iris" database instead of "iris_db", silently skipping its CREATE EXTENSION statement)
+  command:
+    cmd: docker exec iriswebapp_db psql -U iris -d iris_db -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+  register: iris_pgcrypto
+  changed_when: "'CREATE EXTENSION' in iris_pgcrypto.stdout"
+
+- name: Start remaining DFIR-IRIS services
   command:
     cmd: docker compose up -d
     chdir: "{{ deploy_base_dir }}/dfir-iris"

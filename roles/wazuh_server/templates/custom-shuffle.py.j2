@@ -7,7 +7,7 @@ Wazuh's integratord invokes it as:
     custom-shuffle <alert_file> <api_key> <hook_url>
 We ignore positional args and use the URLs baked in at deploy time.
 
-Posts to two webhooks with different filters:
+Posts to three webhooks with different filters:
   1. IRIS-case workflow (legacy) — every alert (level >= integration <level>)
      keeps existing case automation working for all of SOC, not just DDoS.
   2. DDoS auto-response workflow — ONLY rule IDs 100210/100212/100213, the
@@ -16,8 +16,22 @@ Posts to two webhooks with different filters:
      tier upward, never a per-request base tag (100200/100211/100220/
      100230) — those fire once per HTTP request and would flood Shuffle/
      AbuseIPDB with noise for zero decision value).
+  3. USB-DLP auto-response workflow — rule 100500 (file written to the
+     simulated removable disk), see roles/wazuh_usb_dlp_rules. Unlike the
+     DDoS rules, 100500 is NOT a frequency rule — it fires once per real
+     file write, not once per matching event above a threshold — so every
+     occurrence is forwarded. Shuffle's own scoring (usb_dlp_score_alert.py)
+     needs every single event to compute its 10-minute same-endpoint
+     history dimension; debouncing here would silently undercount it.
+  4. Insider-threat auto-response workflow — rules 100400-100410, see
+     roles/wazuh_insider_threat_rules. These are auditd-sourced, host-based
+     events with no data.srcip at all (same situation as 100500), so they
+     always take the "empty srcip = never debounced" path below and every
+     occurrence is forwarded - the workflow's own Wazuh-indexer history
+     query needs to see every event to reconstruct the attack-chain
+     progression depth, same reasoning as USB-DLP's 10-minute history.
 
-Failure on one webhook does not block the other.
+Failure on one webhook does not block the others.
 
 Debounced per (srcip, rule_id), not per srcip alone: a real flood makes a
 single frequency rule (e.g. 100210) re-fire on every matching event once
@@ -40,7 +54,9 @@ rule_id) instead gives each distinct rule its own independent debounce
 clock, so 100210's noise can't crowd out 100213 forwarding on schedule.
 Alerts with no srcip (non-DDoS SOC alerts from FreeIPA/Nextcloud/Mailcow
 etc, which aren't floods) are never debounced, since keying on an empty
-string would cross-suppress unrelated alert types.
+string would cross-suppress unrelated alert types. FIM alerts (rule 100500)
+have no data.srcip at all, so this same "empty srcip = never debounced"
+path is exactly what lets every 100500 event through unthrottled too.
 """
 import json
 import os
@@ -51,6 +67,8 @@ import urllib.error
 
 IRIS_WEBHOOK_URL = "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_webhook_trigger_id }}"
 DDOS_WEBHOOK_URL = "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_ddos_webhook_trigger_id }}"
+USB_DLP_WEBHOOK_URL = "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_usb_dlp_webhook_trigger_id }}"
+INSIDER_THREAT_WEBHOOK_URL = "http://{{ wazuh_server_ip }}:5001/api/v1/hooks/webhook_{{ shuffle_insider_threat_webhook_trigger_id }}"
 SHUFFLE_API_KEY = "{{ shuffle_default_apikey }}"
 
 # ddos-plan.txt Part 2: forward the escalation-worthy rules only, not the
@@ -59,6 +77,14 @@ SHUFFLE_API_KEY = "{{ shuffle_default_apikey }}"
 # roles/wazuh_ddos_rules/files/local_rules_ddos.xml for the full rule
 # chain each of these belongs to.
 DDOS_FORWARD_RULE_IDS = {"100210", "100212", "100213", "100221", "100222", "100231", "100232"}
+
+# Every occurrence of 100500 is forwarded (not a frequency rule - see module
+# docstring). roles/wazuh_usb_dlp_rules/files/local_rules_usb_dlp.xml.
+USB_DLP_FORWARD_RULE_IDS = {"100500"}
+
+# All of 100400-100410 (auditd-sourced, no data.srcip - never debounced,
+# same reasoning as 100500 above). roles/wazuh_insider_threat_rules/files/local_rules_insider_threat.xml.
+INSIDER_THREAT_FORWARD_RULE_IDS = {"100400", "100402", "100403", "100405", "100406", "100407", "100408", "100410"}
 
 DEBOUNCE_SECONDS = 10
 DEBOUNCE_DIR = "/tmp/custom-shuffle-debounce"
@@ -110,6 +136,12 @@ def main():
 
     if rule_id in DDOS_FORWARD_RULE_IDS:
         post(DDOS_WEBHOOK_URL, payload)
+
+    if rule_id in USB_DLP_FORWARD_RULE_IDS:
+        post(USB_DLP_WEBHOOK_URL, payload)
+
+    if rule_id in INSIDER_THREAT_FORWARD_RULE_IDS:
+        post(INSIDER_THREAT_WEBHOOK_URL, payload)
 
 
 if __name__ == "__main__":

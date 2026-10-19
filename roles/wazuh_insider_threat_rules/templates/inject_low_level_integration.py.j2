@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Inject a SECOND <integration name="custom-shuffle"> block into the Wazuh
+manager's host-side ossec.conf (idempotent), scoped by <rule_id> instead of
+<level>, so the scenario-3 rules below the shared wazuh_alert_min_level
+(7) still reach custom-shuffle.py without lowering that threshold for
+every other alert source in SOC (FreeIPA/Nextcloud/Mailcow/DDoS/USB-DLP).
+
+Confirmed live (integrator.debug=2, manual whoami/nmap test) that <rule_id>
+genuinely bypasses the <level> gate entirely when no <level> tag is present
+on the block, and that this does NOT double-dispatch rules also covered by
+the existing global block: integratord evaluates each <integration> block
+independently per alert and logs "Skipping: Rule doesn't match" for the
+block whose rule_id list doesn't include that rule, with no duplicate
+"File ... was written" entries observed for a single alert.
+
+Only 100400/100405/100406/100407/100408 are listed - 100402 (level 8),
+100403 (level 10), and 100410 (level 14) already clear the existing global
+<level>7</level> block and must NOT be duplicated here (confirmed this
+would otherwise double-dispatch them).
+"""
+import re
+import shutil
+import sys
+import xml.etree.ElementTree as ET
+
+OSSEC_CONF = "{{ wazuh_manager_host_conf }}"
+START = "<!-- BEGIN: prlab-insider-threat-low-level-integration -->"
+END = "<!-- END: prlab-insider-threat-low-level-integration -->"
+
+block = f"""
+{START}
+<integration>
+    <name>custom-shuffle</name>
+    <rule_id>100400,100405,100406,100407,100408</rule_id>
+    <alert_format>json</alert_format>
+</integration>
+{END}
+""".strip()
+
+with open(OSSEC_CONF, "r") as f:
+    content = f.read()
+
+# Idempotent no-op: this exact block (by marker) is already present verbatim.
+if block in content:
+    print("NOCHANGE")
+    sys.exit(0)
+
+# Strip any stale/previous copy of this role's block before reinserting.
+content = re.sub(
+    re.escape(START) + r".*?" + re.escape(END) + r"\s*",
+    "",
+    content,
+    flags=re.DOTALL,
+)
+
+close_marker = "</integration>"
+last_idx = content.rfind(close_marker)
+if last_idx != -1:
+    insert_at = last_idx + len(close_marker)
+else:
+    open_marker = "<ossec_config>"
+    idx = content.find(open_marker)
+    if idx == -1:
+        print(f"ERROR: neither {close_marker!r} nor {open_marker!r} found in {OSSEC_CONF} - refusing to modify", file=sys.stderr)
+        sys.exit(1)
+    insert_at = idx + len(open_marker)
+
+new_content = content[:insert_at] + "\n" + block + "\n" + content[insert_at:]
+
+# ossec.conf may legitimately contain multiple sibling <ossec_config> root
+# blocks concatenated together (Wazuh's own loader wraps the whole file in a
+# synthetic root before parsing) - do the same here before validating.
+try:
+    ET.fromstring(f"<root>{new_content}</root>")
+except ET.ParseError as e:
+    print(f"ERROR: resulting {OSSEC_CONF} would not be well-formed XML, not writing: {e}", file=sys.stderr)
+    sys.exit(1)
+
+shutil.copy2(OSSEC_CONF, OSSEC_CONF + ".bak")
+
+with open(OSSEC_CONF, "w") as f:
+    f.write(new_content)
+
+print("CHANGED")

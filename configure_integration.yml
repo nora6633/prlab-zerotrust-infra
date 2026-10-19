@@ -15,7 +15,52 @@
   gather_facts: true
 
   tasks:
-    # ── Shuffle: import workflow ──────────────────────────────────────────
+    # ── Fail fast if any value this playbook bakes into a Shuffle workflow
+    # or custom-shuffle.py is still a placeholder. Shuffle stores imported
+    # values as static JSON (it does not re-read group_vars later), so a
+    # CHANGE_ME here gets baked into a live, hard-to-detect broken system
+    # instead of failing loudly up front. dmz_windows_agent_id is
+    # deliberately NOT checked - a topology with no Windows DMZ host
+    # legitimately has no value to put there. Checked individually (one
+    # assert per variable via loop, not one big combined assert) so the
+    # fail_msg names the exact offending variable instead of listing every
+    # candidate and leaving the reader to guess which one is actually bad. ──
+    - name: "Fail fast if a required credential/identifier is still a placeholder: {{ item.name }}"
+      assert:
+        that:
+          - item.value != "CHANGE_ME"
+          - item.value | length > 0
+        fail_msg: >-
+          group_vars/soc.yml: {{ item.name }} is still "CHANGE_ME" or empty.
+          {{ item.hint }} Fix this in group_vars/soc.yml before running this
+          playbook.
+      loop:
+        - { name: "wazuh_indexer_password", value: "{{ wazuh_indexer_password }}", hint: "This must match the upstream wazuh-docker project's INDEXER_PASSWORD - see the Change secrets section of README.md." }
+        - { name: "wazuh_api_password", value: "{{ wazuh_api_password }}", hint: "This must match the password hardcoded in roles/wazuh_server/templates/wazuh.yml.j2 - see the Change secrets section of README.md." }
+        - { name: "dmz_ubuntu_agent_id", value: "{{ dmz_ubuntu_agent_id }}", hint: "Look this up with: docker exec single-node-wazuh.manager-1 /var/ossec/bin/agent_control -l" }
+        - { name: "iris_adm_api_key", value: "{{ iris_adm_api_key }}", hint: "Choose a real value before first deploy - DFIR-IRIS adopts it as its actual admin API key at container boot." }
+        - { name: "abuseipdb_api_key", value: "{{ abuseipdb_api_key }}", hint: "Only used by the DDoS workflow's AbuseIPDB lookup node, imported unconditionally by this playbook regardless of which scenario you actually want - a placeholder string is fine here if you are not using the DDoS scenario (get a free real key at https://www.abuseipdb.com/account/api if you are)." }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Fail fast if wazuh_server_ip is empty (derived automatically from inventory/hosts.ini, not a CHANGE_ME-style placeholder)
+      assert:
+        that:
+          - wazuh_server_ip | length > 0
+        fail_msg: >-
+          group_vars/all.yml derives wazuh_server_ip from inventory/hosts.ini's
+          soc-host ansible_host, but it came back empty - check that
+          inventory/hosts.ini has a real value there.
+
+    # ── Shuffle: import workflow (idempotent — see note below) ────────────
+    # Shuffle's POST /api/v1/workflows import API is not an upsert: every
+    # call creates a brand-new workflow document, even when one with the
+    # same name already exists. Re-running this playbook used to pile up a
+    # fresh duplicate of all three workflows every time (confirmed live:
+    # 5-6 duplicates each had already accumulated in this environment
+    # before this fix). Each workflow is now only imported when a workflow
+    # with that exact name doesn't already exist, mirroring the pattern
+    # already proven in configure_insider_threat_integration.yml.
     - name: Ensure Shuffle backend is reachable
       uri:
         url: "http://{{ wazuh_server_ip }}:5001/api/v1/health"
@@ -26,13 +71,27 @@
       retries: 12
       delay: 5
 
-    - name: Template Wazuh-to-IRIS workflow JSON onto host
+    - name: Fetch current workflow list once
+      shell: |
+        curl -ks -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
+          "http://{{ wazuh_server_ip }}:5001/api/v1/workflows"
+      register: shuffle_workflows_raw
+      changed_when: false
+
+    - name: Check which of the three workflows already exist
+      set_fact:
+        iris_existing: "{{ shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Alert to DFIR-IRIS Case') | list }}"
+        ddos_existing: "{{ shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | list }}"
+        usb_dlp_existing: "{{ shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh USB-DLP Auto-Response') | list }}"
+
+    - name: Template Wazuh-to-IRIS workflow JSON onto host (only when it doesn't already exist)
       template:
         src: roles/shuffle/templates/wazuh_iris_workflow.json.j2
         dest: "{{ deploy_base_dir }}/shuffle/wazuh_iris_workflow.json"
         mode: '0644'
+      when: iris_existing | length == 0
 
-    - name: Import IRIS workflow into Shuffle via API (curl, avoids uri module bytes issue)
+    - name: Import IRIS workflow into Shuffle via API (curl, avoids uri module bytes issue; only when it doesn't already exist)
       shell: |
         curl -ks -o /tmp/iris_import.out -w "%{http_code}" -X POST \
           "http://{{ wazuh_server_ip }}:5001/api/v1/workflows" \
@@ -40,20 +99,23 @@
           -H "Content-Type: application/json" \
           --data @{{ deploy_base_dir }}/shuffle/wazuh_iris_workflow.json
       register: iris_workflow_import
+      when: iris_existing | length == 0
       changed_when: iris_workflow_import.stdout in ["200", "201"]
       failed_when: iris_workflow_import.stdout not in ["200", "201"]
 
-    - name: Load Python scorer source for DDoS workflow N5
+    - name: Load Python scorer source for DDoS workflow N5 (only when it doesn't already exist)
       set_fact:
         score_alert_code: "{{ lookup('file', 'roles/shuffle/files/ddos_score_alert.py') }}"
+      when: ddos_existing | length == 0
 
-    - name: Template DDoS workflow JSON onto host (with embedded Python scorer)
+    - name: Template DDoS workflow JSON onto host (with embedded Python scorer; only when it doesn't already exist)
       template:
         src: roles/shuffle/templates/wazuh_ddos_workflow.json.j2
         dest: "{{ deploy_base_dir }}/shuffle/wazuh_ddos_workflow.json"
         mode: '0644'
+      when: ddos_existing | length == 0
 
-    - name: Import DDoS workflow into Shuffle via API (curl)
+    - name: Import DDoS workflow into Shuffle via API (curl; only when it doesn't already exist)
       shell: |
         curl -ks -o /tmp/ddos_import.out -w "%{http_code}" -X POST \
           "http://{{ wazuh_server_ip }}:5001/api/v1/workflows" \
@@ -61,36 +123,106 @@
           -H "Content-Type: application/json" \
           --data @{{ deploy_base_dir }}/shuffle/wazuh_ddos_workflow.json
       register: ddos_workflow_import
+      when: ddos_existing | length == 0
       changed_when: ddos_workflow_import.stdout in ["200", "201"]
       failed_when: ddos_workflow_import.stdout not in ["200", "201"]
 
     - name: Show DDoS import response
       shell: cat /tmp/ddos_import.out
       register: ddos_import_resp
+      when: ddos_existing | length == 0
       changed_when: false
 
     - debug:
         msg: "{{ ddos_import_resp.stdout | truncate(200) }}"
+      when: ddos_existing | length == 0
+
+    - name: Load Python scorer source for USB-DLP workflow (only when it doesn't already exist)
+      set_fact:
+        usb_dlp_score_alert_code: "{{ lookup('file', 'roles/shuffle/files/usb_dlp_score_alert.py') }}"
+      when: usb_dlp_existing | length == 0
+
+    - name: Template USB-DLP workflow JSON onto host (with embedded Python scorer; only when it doesn't already exist)
+      template:
+        src: roles/shuffle/templates/wazuh_usb_dlp_workflow.json.j2
+        dest: "{{ deploy_base_dir }}/shuffle/wazuh_usb_dlp_workflow.json"
+        mode: '0644'
+      when: usb_dlp_existing | length == 0
+
+    - name: Import USB-DLP workflow into Shuffle via API (curl; only when it doesn't already exist)
+      shell: |
+        curl -ks -o /tmp/usb_dlp_import.out -w "%{http_code}" -X POST \
+          "http://{{ wazuh_server_ip }}:5001/api/v1/workflows" \
+          -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
+          -H "Content-Type: application/json" \
+          --data @{{ deploy_base_dir }}/shuffle/wazuh_usb_dlp_workflow.json
+      register: usb_dlp_workflow_import
+      when: usb_dlp_existing | length == 0
+      changed_when: usb_dlp_workflow_import.stdout in ["200", "201"]
+      failed_when: usb_dlp_workflow_import.stdout not in ["200", "201"]
+
+    - name: Show USB-DLP import response
+      shell: cat /tmp/usb_dlp_import.out
+      register: usb_dlp_import_resp
+      when: usb_dlp_existing | length == 0
+      changed_when: false
+
+    - debug:
+        msg: "{{ usb_dlp_import_resp.stdout | truncate(200) }}"
+      when: usb_dlp_existing | length == 0
+
+    - debug:
+        msg:
+          - "IRIS workflow: {{ 'imported fresh' if iris_existing | length == 0 else 'already present, reused' }}"
+          - "DDoS workflow: {{ 'imported fresh' if ddos_existing | length == 0 else 'already present, reused' }}"
+          - "USB-DLP workflow: {{ 'imported fresh' if usb_dlp_existing | length == 0 else 'already present, reused' }}"
 
     # ── Wazuh: install custom integration ────────────────────────────────
-    # ── Capture Shuffle-assigned trigger IDs (Shuffle re-generates UUIDs on import) ──
-    - name: Query Shuffle for actual webhook trigger IDs
+    # ── Capture Shuffle-assigned trigger IDs (re-fetch picks up any fresh
+    # import above; harmless no-op re-fetch when nothing changed). Sorted
+    # by created-descending so that if duplicates already exist from before
+    # this fix, every run consistently picks the SAME (newest) one instead
+    # of whatever order Shuffle happens to return — matching the selection
+    # custom-shuffle.py's actual deployed behavior already depends on. ──
+    - name: Re-fetch workflow list (picks up a fresh import; harmless no-op re-fetch otherwise)
       shell: |
         curl -ks -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
           "http://{{ wazuh_server_ip }}:5001/api/v1/workflows"
       register: shuffle_workflows_raw
       changed_when: false
 
-    - name: Parse trigger IDs from Shuffle workflows
+    - name: Parse trigger IDs from Shuffle workflows (newest by created, in case duplicates already exist)
       set_fact:
-        shuffle_iris_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Alert to DFIR-IRIS Case') | first).triggers[0].id }}"
-        shuffle_ddos_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | first).triggers[0].id }}"
+        shuffle_iris_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Alert to DFIR-IRIS Case') | sort(attribute='created', reverse=true) | first).triggers[0].id }}"
+        shuffle_ddos_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | sort(attribute='created', reverse=true) | first).triggers[0].id }}"
+        shuffle_usb_dlp_actual_trig: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh USB-DLP Auto-Response') | sort(attribute='created', reverse=true) | first).triggers[0].id }}"
+
+    # custom-shuffle.py is re-rendered below on every run of this playbook -
+    # look up the insider-threat workflow's CURRENT trigger id (if scenario 3
+    # has already been deployed) so that re-render doesn't clobber it back to
+    # group_vars/soc.yml's permanently-stale CHANGE_ME placeholder. See
+    # tasks/resolve_insider_threat_trigger.yml's header comment for why this
+    # exists.
+    #
+    # Capture the group_vars value under a different name BEFORE the lookup -
+    # referencing shuffle_insider_threat_webhook_trigger_id inside its own
+    # default() below (same name on both sides) is a self-reference that
+    # Ansible's templating engine treats as a recursive loop, not a safe
+    # "fall through to the outer-scope value" - confirmed live
+    # (RecursionError / "recursive loop detected in template string").
+    - name: Capture group_vars' insider-threat trigger id as a fallback (different name, avoids a templating self-reference below)
+      set_fact:
+        shuffle_insider_threat_webhook_trigger_id_fallback: "{{ shuffle_insider_threat_webhook_trigger_id }}"
+
+    - name: Look up the insider-threat workflow's current trigger id, if deployed (shared with configure_insider_threat_integration.yml)
+      include_tasks: tasks/resolve_insider_threat_trigger.yml
 
     - name: Show captured trigger IDs
       debug:
         msg:
           - "IRIS webhook trigger: {{ shuffle_iris_actual_trig }}"
           - "DDoS webhook trigger: {{ shuffle_ddos_actual_trig }}"
+          - "USB-DLP webhook trigger: {{ shuffle_usb_dlp_actual_trig }}"
 
     # "start" here is load-bearing, not cosmetic: Shuffle stores each webhook
     # trigger as its own document in a separate OpenSearch "hooks" index, and
@@ -102,7 +234,7 @@
     # (confirmed live: last_node empty, zero results, execution stuck in
     # EXECUTING forever) - detection still fires correctly and custom-shuffle
     # forwards successfully, but the workflow DAG silently never runs.
-    - name: Activate both webhook hooks (idempotent)
+    - name: Activate all webhook hooks (idempotent)
       shell: |
         curl -ks -X POST -H "Authorization: Bearer {{ shuffle_default_apikey }}" \
           -H "Content-Type: application/json" \
@@ -111,6 +243,7 @@
       loop:
         - { trig: "{{ shuffle_iris_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh Alert to DFIR-IRIS Case') | first).id }}", name: "Wazuh Webhook", start: "iris-create-case" }
         - { trig: "{{ shuffle_ddos_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh DDoS Auto-Response') | first).id }}", name: "DDoS Webhook", start: "dedupe_check" }
+        - { trig: "{{ shuffle_usb_dlp_actual_trig }}", wf: "{{ (shuffle_workflows_raw.stdout | from_json | selectattr('name', 'equalto', 'Wazuh USB-DLP Auto-Response') | first).id }}", name: "USB DLP Webhook", start: "history_check" }
       changed_when: false
 
     - name: Template custom-shuffle integration script (with actual trigger IDs)
@@ -121,6 +254,8 @@
       vars:
         shuffle_webhook_trigger_id: "{{ shuffle_iris_actual_trig }}"
         shuffle_ddos_webhook_trigger_id: "{{ shuffle_ddos_actual_trig }}"
+        shuffle_usb_dlp_webhook_trigger_id: "{{ shuffle_usb_dlp_actual_trig }}"
+        shuffle_insider_threat_webhook_trigger_id: "{{ shuffle_insider_threat_actual_trig | default(shuffle_insider_threat_webhook_trigger_id_fallback) }}"
 
     - name: Copy integration script into single-node-wazuh.manager-1 container
       command: docker cp /tmp/custom-shuffle single-node-wazuh.manager-1:/var/ossec/integrations/custom-shuffle
@@ -140,6 +275,7 @@
     - name: Inject Shuffle integration block into host-side wazuh_manager.conf
       command: python3 /tmp/inject_integration.py
       register: inject_result
+      changed_when: "'CHANGED' in inject_result.stdout"
 
     - name: Show injection result
       debug:
@@ -147,6 +283,17 @@
 
     - name: Restart single-node-wazuh.manager-1 to apply integration config
       command: docker restart single-node-wazuh.manager-1
+
+    - name: Wait for Wazuh manager API to come back
+      uri:
+        url: "https://{{ wazuh_server_ip }}:55000/"
+        method: GET
+        validate_certs: false
+        status_code: [200, 401]
+      register: api_check
+      until: api_check.status in [200, 401]
+      retries: 30
+      delay: 10
 
     # ── Summary ───────────────────────────────────────────────────────────
     - name: Print integration summary
@@ -156,7 +303,7 @@
           - ""
           - "Data flow:"
           - "  Wazuh alert (level >= {{ wazuh_alert_min_level }})"
-          - "    → Shuffle webhook: http://{{ wazuh_server_ip }}:5001/api/v1/hooks/{{ shuffle_webhook_trigger_id }}"
+          - "    → Shuffle webhook: http://{{ wazuh_server_ip }}:5001/api/v1/hooks/{{ shuffle_iris_actual_trig }}"
           - "    → DFIR-IRIS case:  https://{{ wazuh_server_ip }}:4444"
           - ""
           - "Service endpoints:"

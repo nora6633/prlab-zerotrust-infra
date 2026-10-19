@@ -1,0 +1,338 @@
+{
+  "id": "{{ shuffle_usb_dlp_workflow_id }}",
+  "name": "Wazuh USB-DLP Auto-Response",
+  "description": "Simulated removable-disk file writes (rule 100500) -> 4-dimension score (file size / extension / time-of-day / 10-min same-endpoint history via Shuffle Cache) -> ESCALATE_AND_CONTAIN (block write access via Wazuh Active Response API) / NOTIFY_SOC (human review) / LOG_ONLY.",
+  "tags": ["wazuh", "dlp", "usb", "soar", "active-response"],
+  "status": "running",
+  "workflow_variables": [],
+  "actions": [
+
+    {
+      "id": "history_check",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "shuffle-tools",
+      "name": "get_cache_value",
+      "label": "history_check",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "key",
+          "value": "usb_dlp_history:$exec.agent.id"
+        }
+      ],
+      "position": {"x": 300, "y": 250}
+    },
+
+    {
+      "id": "score_alert",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "shuffle-tools",
+      "name": "execute_python",
+      "label": "score_alert",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "code",
+          "value": {{ usb_dlp_score_alert_code | to_json }}
+        }
+      ],
+      "position": {"x": 600, "y": 250}
+    },
+
+    {
+      "id": "set_history_cache",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "shuffle-tools",
+      "name": "set_cache_value",
+      "label": "set_history_cache",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "key",
+          "value": "usb_dlp_history:$exec.agent.id"
+        },
+        {
+          "name": "value",
+          "value": "$score_alert.message.updated_history_json"
+        }
+      ],
+      "position": {"x": 900, "y": 100}
+    },
+
+    {
+      "id": "wazuh_auth",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "POST",
+      "label": "wazuh_auth",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:55000/security/user/authenticate?raw=true"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Basic {{ (wazuh_api_user + ':' + wazuh_api_password) | b64encode }}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 900, "y": 250}
+    },
+
+    {
+      "id": "wazuh_ar_block_usb",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "PUT",
+      "label": "wazuh_ar_block_usb",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:55000/active-response?agents_list={{ dmz_windows_agent_id }}&pretty=true"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Bearer $wazuh_auth.body\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"command\":\"block-usb-write0\",\"arguments\":[\"$score_alert.message.file_path\"],\"alert\":{\"data\":{\"file\":\"$score_alert.message.file_path\"}}}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 1200, "y": 250}
+    },
+
+    {
+      "id": "escalate_iris_alert",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "POST",
+      "label": "escalate_iris_alert",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:4444/alerts/add"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Bearer {{ iris_adm_api_key }}\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"alert_title\":\"ESCALATE_AND_CONTAIN: USB write-block applied on $exec.agent.name\",\"alert_description\":\"File: $score_alert.message.file_path (size $score_alert.message.file_size bytes)\\nScore: $score_alert.message.score/100\\n$score_alert.message.evidence_md\\n\\nWrite access to the simulated removable disk has been blocked (Active Response: block-usb-write). Manual unblock required.\",\"alert_severity_id\":5,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$score_alert.message.alert_timestamp\"}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 1500, "y": 250}
+    },
+
+    {
+      "id": "notify_soc_review",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "POST",
+      "label": "notify_soc_review",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:4444/alerts/add"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Bearer {{ iris_adm_api_key }}\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"alert_title\":\"NOTIFY_SOC: review USB write on $exec.agent.name\",\"alert_description\":\"File: $score_alert.message.file_path (size $score_alert.message.file_size bytes)\\nScore: $score_alert.message.score/100 - manual triage required, block NOT yet applied.\\n\\nEvidence:\\n$score_alert.message.evidence_md\",\"alert_severity_id\":3,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$score_alert.message.alert_timestamp\"}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 900, "y": 450}
+    },
+
+    {
+      "id": "iris_log_alert",
+      "app_name": "HTTP",
+      "app_version": "1.4.0",
+      "app_id": "http",
+      "name": "POST",
+      "label": "iris_log_alert",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "url",
+          "value": "https://{{ wazuh_server_ip }}:4444/alerts/add"
+        },
+        {
+          "name": "headers",
+          "value": "Authorization: Bearer {{ iris_adm_api_key }}\r\nContent-Type: application/json"
+        },
+        {
+          "name": "body",
+          "value": "{\"alert_title\":\"LOG_ONLY: USB write on $exec.agent.name\",\"alert_description\":\"File: $score_alert.message.file_path (size $score_alert.message.file_size bytes)\\nScore: $score_alert.message.score/100 - below NOTIFY_SOC threshold, logged for visibility only, no action taken.\\n\\n$score_alert.message.evidence_md\",\"alert_severity_id\":1,\"alert_status_id\":2,\"alert_customer_id\":1,\"alert_classification_id\":1,\"alert_source\":\"Wazuh\",\"alert_source_ref\":\"$exec.id\",\"alert_source_link\":\"https://{{ wazuh_server_ip }}\",\"alert_source_event_time\":\"$score_alert.message.alert_timestamp\"}"
+        },
+        {
+          "name": "verify",
+          "value": "false"
+        }
+      ],
+      "position": {"x": 900, "y": 650}
+    },
+
+    {
+      "id": "bump_watch_flag",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "shuffle-tools",
+      "name": "set_cache_value",
+      "label": "bump_watch_flag",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "parameters": [
+        {
+          "name": "key",
+          "value": "usb_dlp_watch:$exec.agent.id"
+        },
+        {
+          "name": "value",
+          "value": "$exec.timestamp"
+        }
+      ],
+      "position": {"x": 1200, "y": 650}
+    }
+
+  ],
+  "triggers": [
+    {
+      "app_name": "Shuffle Triggers",
+      "name": "USB DLP Webhook",
+      "description": "Receives Wazuh USB-DLP alerts (rule.id 100500 - filtered by custom-shuffle integration, see custom-shuffle.py.j2)",
+      "id": "{{ shuffle_usb_dlp_webhook_trigger_id }}",
+      "type": "WEBHOOK",
+      "status": "running",
+      "isStartNode": true,
+      "app_version": "1.0.0",
+      "parameters": [
+        {
+          "name": "info",
+          "value": "Receives Wazuh alerts via HTTP POST. Rule-ID filtering happens in custom-shuffle, not here."
+        }
+      ],
+      "position": {"x": 50, "y": 250}
+    }
+  ],
+  "branches": [
+
+    {
+      "id": "br-trigger-to-history",
+      "source_id": "{{ shuffle_usb_dlp_webhook_trigger_id }}",
+      "destination_id": "history_check",
+      "label": ""
+    },
+    {
+      "id": "br-history-to-score",
+      "source_id": "history_check",
+      "destination_id": "score_alert",
+      "label": ""
+    },
+    {
+      "id": "br-score-to-cache",
+      "source_id": "score_alert",
+      "destination_id": "set_history_cache",
+      "label": "always persist this firing, regardless of decision band"
+    },
+
+    {
+      "id": "br-score-to-wazuh-auth",
+      "source_id": "score_alert",
+      "destination_id": "wazuh_auth",
+      "label": "ESCALATE_AND_CONTAIN (score >= 60)",
+      "conditions": [
+        {
+          "source": {"name": "action", "value": "$score_alert"},
+          "destination": {"value": "\"action\": \"ESCALATE_AND_CONTAIN\""},
+          "condition": {"value": "contains"}
+        }
+      ]
+    },
+    {
+      "id": "br-wazuh-auth-to-ar",
+      "source_id": "wazuh_auth",
+      "destination_id": "wazuh_ar_block_usb",
+      "label": ""
+    },
+    {
+      "id": "br-ar-to-escalate-alert",
+      "source_id": "wazuh_ar_block_usb",
+      "destination_id": "escalate_iris_alert",
+      "label": ""
+    },
+
+    {
+      "id": "br-score-to-notify-review",
+      "source_id": "score_alert",
+      "destination_id": "notify_soc_review",
+      "label": "NOTIFY_SOC (40-59)",
+      "conditions": [
+        {
+          "source": {"name": "action", "value": "$score_alert"},
+          "destination": {"value": "\"action\": \"NOTIFY_SOC\""},
+          "condition": {"value": "contains"}
+        }
+      ]
+    },
+
+    {
+      "id": "br-score-to-log",
+      "source_id": "score_alert",
+      "destination_id": "iris_log_alert",
+      "label": "LOG_ONLY (score < 40) - no block, plain alert",
+      "conditions": [
+        {
+          "source": {"name": "action", "value": "$score_alert"},
+          "destination": {"value": "\"action\": \"LOG_ONLY\""},
+          "condition": {"value": "contains"}
+        }
+      ]
+    },
+    {
+      "id": "br-log-to-watch",
+      "source_id": "iris_log_alert",
+      "destination_id": "bump_watch_flag",
+      "label": "mark endpoint for heightened monitoring (Shuffle-cache flag proxy - Wazuh has no live FIM-scan-frequency API)"
+    }
+
+  ]
+}

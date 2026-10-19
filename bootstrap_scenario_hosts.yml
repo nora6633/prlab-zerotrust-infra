@@ -1,0 +1,96 @@
+---
+# Bootstraps the dmz-ubuntu and ubuntu-lan Docker containers that stand in
+# for the "external" (Linux DMZ) and "lan" hosts when this lab is run as a
+# single machine instead of 3 real hosts (see README.md's "Single machine
+# simulating 3 hosts vs. 3 real hosts"). Nothing else in this repo creates
+# these - site.yml and every scenario playbook assume dmz-ubuntu/lan-host
+# are already up and reachable via SSH.
+#
+# Run this BEFORE site.yml. Full order for a single-machine deployment:
+#   1. ansible-playbook -i inventory/hosts.ini bootstrap_scenario_hosts.yml
+#   2. ansible-playbook -i inventory/hosts.ini site.yml
+#   3. ansible-playbook -i inventory/hosts.ini deploy_insider_threat_response.yml
+#   4. ansible-playbook -i inventory/hosts.ini configure_insider_threat_integration.yml
+#
+# dmz-ubuntu/docker-compose.yaml declares TWO external:true networks -
+# dmz-ubuntu_default AND scenario3-link. This means dmz-ubuntu's container
+# cannot start at all without scenario3-link existing, even if all you want
+# is the plain DDoS/Juice-Shop use of this host and have no interest in the
+# insider-threat scenario - the two are coupled at the compose-file level
+# as this repo currently stands. Both networks are created directly here
+# (not by including roles/insider_threat_network, which also tries to
+# `docker network connect` the "lan" container - that role assumes both
+# containers already exist, which isn't true yet at this point in the
+# sequence). roles/insider_threat_network re-asserting scenario3-link's
+# existence later (from deploy_insider_threat_response.yml) is a harmless
+# no-op - community.docker.docker_network with state:present is idempotent
+# regardless of which playbook asserts it.
+#
+# ubuntu-lan/docker-compose.yaml does NOT declare any external:true network
+# - `docker compose up` creates ubuntu-lan_default itself, no pre-creation
+# needed for it here.
+#
+# Idempotent: re-running this playbook does not recreate already-running
+# containers or touch their data. docker_network's state:present is a
+# no-op if the network already exists with the same config. `docker
+# compose up -d --no-recreate` leaves an already-running container alone
+# even if its rendered config has drifted since it was created - this
+# playbook's job is "make sure it exists", not "keep it continuously in
+# sync" (re-running `docker compose build` to pick up a Dockerfile change
+# still rebuilds the image either way; it just won't force the running
+# container to pick it up).
+#
+# ⚠️ The `dev` account baked into both images (dmz-ubuntu/Dockerfile,
+# ubuntu-lan/Dockerfile) has a hardcoded lab-only password - change it (or
+# disable password auth entirely in favor of the SSH key already baked in)
+# before using these Dockerfiles anywhere outside a throwaway lab.
+
+- name: Bootstrap dmz-ubuntu and ubuntu-lan Docker containers (single-machine topology)
+  hosts: soc
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Create the dmz-ubuntu_default network (external in dmz-ubuntu's compose file, not created by it)
+      community.docker.docker_network:
+        name: dmz-ubuntu_default
+        driver: bridge
+        ipam_config:
+          - subnet: "172.23.0.0/16"
+        state: present
+
+    - name: Create the scenario3-link network (also external in dmz-ubuntu's compose file - see header comment)
+      community.docker.docker_network:
+        name: "{{ insider_threat_link_network }}"
+        driver: bridge
+        ipam_config:
+          - subnet: "{{ insider_threat_link_subnet }}"
+        state: present
+
+    - name: Build the dmz-ubuntu image
+      command:
+        cmd: docker compose build
+        chdir: "{{ playbook_dir }}/dmz-ubuntu"
+      register: dmz_ubuntu_build
+      changed_when: "'Building' in (dmz_ubuntu_build.stdout + dmz_ubuntu_build.stderr)"
+
+    - name: "Start the dmz-ubuntu container (--no-recreate - never touches an already-running container)"
+      command:
+        cmd: docker compose up -d --no-recreate
+        chdir: "{{ playbook_dir }}/dmz-ubuntu"
+      register: dmz_ubuntu_up
+      changed_when: "'Created' in (dmz_ubuntu_up.stdout + dmz_ubuntu_up.stderr) or 'Started' in (dmz_ubuntu_up.stdout + dmz_ubuntu_up.stderr)"
+
+    - name: Build the ubuntu-lan image
+      command:
+        cmd: docker compose build
+        chdir: "{{ playbook_dir }}/ubuntu-lan"
+      register: ubuntu_lan_build
+      changed_when: "'Building' in (ubuntu_lan_build.stdout + ubuntu_lan_build.stderr)"
+
+    - name: "Start the ubuntu-lan container (--no-recreate - never touches an already-running container)"
+      command:
+        cmd: docker compose up -d --no-recreate
+        chdir: "{{ playbook_dir }}/ubuntu-lan"
+      register: ubuntu_lan_up
+      changed_when: "'Created' in (ubuntu_lan_up.stdout + ubuntu_lan_up.stderr) or 'Started' in (ubuntu_lan_up.stdout + ubuntu_lan_up.stderr)"

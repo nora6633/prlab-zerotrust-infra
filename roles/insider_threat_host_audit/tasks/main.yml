@@ -1,0 +1,30 @@
+---
+# auditd must run on the Docker HOST, not inside dmz-ubuntu - see
+# templates/99-insider-threat.rules.j2 for why. This role targets
+# hosts: soc, which in this inventory is ansible_connection=local, i.e.
+# these tasks run directly on the real machine (same pattern as
+# wazuh_server/shuffle/dfir_iris). Idempotent / safe to re-run.
+
+- name: Install auditd
+  apt:
+    name: auditd
+    state: present
+    update_cache: true
+
+- name: Render insider-threat auditd rules
+  template:
+    src: 99-insider-threat.rules.j2
+    dest: /etc/audit/rules.d/99-insider-threat.rules
+    owner: root
+    group: root
+    mode: '0640'
+  notify: reload audit rules
+
+- name: Ensure auditd is enabled and running
+  systemd:
+    name: auditd
+    enabled: true
+    state: started
+
+- name: Flush handlers now so rules are active before downstream roles use them
+  meta: flush_handlers

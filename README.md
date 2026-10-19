@@ -1,5 +1,7 @@
 # SOC Lab Infrastructure
 
+> Scenario 3 (insider-threat, `insider-threat-test/`) lives on the `scenario3` branch, not `main`. Clone with `git clone -b scenario3 <repo>` if you need it.
+
 Ansible-orchestrated, Docker Compose-based SOC lab across three hosts. Fill in three IP addresses, run two playbooks, and all services are deployed and wired together automatically.
 
 ---
@@ -46,6 +48,13 @@ Wazuh Manager
 │   └── wazuh_ddos_rules/                ← custom decoder/rules + AR config injection
 ├── windows-dmz/
 │   └── setup-dmz.ps1                    ← manual PowerShell fallback (no Ansible)
+├── dmz-ubuntu/                          ← Dockerfile + compose for a container standing in for
+│   └── docker-compose.yaml                the Linux "external" host (single-machine topology
+│                                           only - see "Single machine simulating 3 hosts" below)
+├── ubuntu-lan/                          ← same, standing in for the "lan" host
+│   └── docker-compose.yaml
+├── bootstrap_scenario_hosts.yml         ← creates dmz-ubuntu/ + ubuntu-lan/ containers (run
+│                                           this first if using the single-machine topology)
 ├── site.yml                             ← deploy all services (Linux external)
 ├── deploy_windows_dmz.yml               ← deploy external host as Windows DMZ
 ├── deploy_soc_remaining.yml             ← resume partial SOC deploy (Shuffle + IRIS)
@@ -65,6 +74,17 @@ Wazuh Manager
 | **External (Windows DMZ)** | Juice Shop (NSSM) + Wazuh agent (MSI) | 2 GB | 4 GB | 2 cores | 30 GB |
 
 > The SOC host is the most resource-intensive — it runs two separate OpenSearch instances (Wazuh indexer + Shuffle's OpenSearch), each needing at least 1 GB JVM heap, on top of Wazuh manager, dashboard, and DFIR-IRIS. 8 GB is the floor; 16 GB is recommended for a stable lab.
+
+**Single-machine sizing, measured on a test VM** — the table above is for the 3-separate-real-hosts topology; the numbers below are from a single VM running scenario 3 (`--limit soc-host,dmz-ubuntu`, skipping the optional `lan` play), the only scenario actually tested end-to-end this way:
+
+| | Scenario 3 only (`--limit soc-host,dmz-ubuntu`) | Full deploy (incl. `lan` play) |
+|---|---|---|
+| RAM | **Measured** 6.2 GiB (whole-VM `free -h` used, on a 19GiB test VM) — SOC containers + `dmz-ubuntu` + an empty `lan` container (no FreeIPA/Nextcloud/Mailcow actually running in it). A separate measurement run's `docker stats` summed across the same containers gave ≈7.4 GiB — same ballpark, not identical since it's a different aggregation method. | **Not measured** — Nextcloud/Mailcow/FreeIPA never reached a stable fully-up state together to snapshot, because FreeIPA itself never reaches a stable running state at all (see the FreeIPA note below). The 3-hosts table above's LAN-host figure (4GB min / 8GB recommended) is the closest reference, not re-verified for this topology. |
+| Disk | **Measured** 33GB (`df -h /` used) under the same conditions as the RAM row above: scenario 3 path only, `lan` container present but empty — confirmed via `docker ps -s`, which reported its writable layer at 8.73MB at that point (`bootstrap_scenario_hosts.yml` + `deploy_insider_threat_response.yml`'s network play run, but never the `lan` play itself — no FreeIPA/Nextcloud/Mailcow data in it). `docker system df` breakdown at that point: Images 19.56GB, Containers 2.47GB, Volumes 6.07GB, Build cache 1.78GB. | **No safe number to give.** This test VM's disk hit 100% (96GB/96GB) during testing, traced almost entirely to `lan`'s own writable layer growing past ~60GB (see the FreeIPA note and the disk-full troubleshooting section below). The actual ceiling is unknown — 96GB wasn't enough on this run, so there's no verified "budget N GB and you're safe" number to give here. If disk is constrained, skip the `lan` play entirely (see above); if you do run it, watch `df -h /` continuously rather than relying on a fixed allowance. |
+
+Only a ~19GiB VM was actually tested — nothing smaller. 12GiB is a reasonable first value to try, not a verified minimum.
+
+A full disk causes three separate, independent failures that don't recover on their own (auditd stops logging, OpenSearch goes `red`, Shuffle's backend stops responding) — symptoms show up as Active Response never firing. See "**If the disk actually does fill up...**" further down this section for the recovery steps.
 
 ---
 
@@ -102,6 +122,158 @@ Set-Item WSMan:\localhost\Service\Auth\Basic $true
 Set-Item WSMan:\localhost\Service\AllowUnencrypted $true   # lab only
 ```
 
+### Fresh host/VM setup
+
+If you're starting from a brand new machine/VM with nothing installed yet, here's the exact sequence that's been verified to work end to end. All commands below are for Ubuntu 24.04.
+
+**Clone.** This repo's own `git remote` is configured over SSH for the maintainer's own push access - that URL will fail with `Host key verification failed` on a machine with no SSH key registered against it. Use the HTTPS form instead (works with no authentication, since this repo is public):
+
+```bash
+git clone -b scenario3 https://github.com/nora6633/prlab-zerotrust-infra.git
+cd prlab-zerotrust-infra
+```
+
+**Ansible, and the collections this repo's roles need:**
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ansible git python3-pip
+ansible-galaxy collection list | grep -i docker   # confirm community.docker is already present
+```
+
+The Ubuntu `ansible` apt package already bundles `community.docker` and `community.general` - the separate `ansible-galaxy collection install` step mentioned earlier in this doc is only needed if you installed a bare `ansible-core` via pip instead.
+
+**Docker CE + the Compose v2 plugin.** `bootstrap_scenario_hosts.yml` (and every service role) needs `docker compose` as a subcommand, not the standalone `docker-compose` binary - Ubuntu's own `docker.io` apt package does **not** include it.
+
+⚠️ **This removes `docker.io`/`docker-compose`/`containerd`/`runc` first - only do this on a genuinely fresh machine/VM.** If the host already has containers or data you need to keep, don't paste this blindly; adapt it (or install Docker CE alongside what's there) instead.
+
+```bash
+sudo apt-get remove -y docker.io docker-doc docker-compose podman-docker containerd runc
+sudo apt-get install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker "$USER"
+# The group change above doesn't apply to your current shell/session - log
+# out and back in, or run `newgrp docker`, before `docker`/`docker compose`
+# work without `sudo`.
+docker compose version   # should print a version, not "unknown command: compose"
+```
+
+⚠️ Switching from `docker.io` to `docker-ce` like this can leave `dockerd` in a crash-restart loop for a few seconds (`systemctl status docker` shows `Start request repeated too quickly`), apparently from a stale `iptables` lock held by the just-removed daemon. If `docker compose version` above fails to connect to the daemon, this clears it:
+
+```bash
+sudo pkill -9 dockerd
+sudo systemctl reset-failed docker
+sudo systemctl start docker
+```
+
+### Single machine simulating 3 hosts vs. 3 real hosts
+
+The Architecture diagram above describes 3 logically separate hosts (External/SOC/LAN). Nothing about the roles themselves requires that — `site.yml` just targets whatever `inventory/hosts.ini` groups resolve to. In practice this lab is commonly run **on a single physical machine**, with each "host" actually being a separate Docker container/bridge network on that one machine, and `inventory/hosts.ini`'s `ansible_host` values pointing at those containers' bridge IPs rather than separate real machines. If that's your setup:
+
+- The `soc` group's `ansible_host` is the Docker host's own address (same machine Ansible runs on), with `ansible_connection=local`.
+- `external`/`lan` point at container IPs on their own bridge networks, not separate VMs.
+- **`dmz-ubuntu`'s address is fixed and known in advance: `dmz-ubuntu/docker-compose.yaml` declares `ipv4_address: 172.23.0.2` on its `default` network** (plus `172.30.0.2` on `scenario3-link`, used by scenario 3's Linux AR target). Put `172.23.0.2` directly into `inventory/hosts.ini`'s `dmz-ubuntu` entry — no need to inspect anything for this one.
+- **`ubuntu-lan` has no fixed address at all** — its `docker-compose.yaml` declares no `networks:` block with a static IP, so `docker compose up` creates a fresh bridge network and assigns whatever IP is free. This means a chicken-and-egg problem writing `hosts.ini`: you can't know the real IP until after the container exists, and the container doesn't exist until `bootstrap_scenario_hosts.yml` runs. The sequence:
+  ```bash
+  # 1. Put a placeholder in hosts.ini's lan-host entry for now, then:
+  ansible-playbook -i inventory/hosts.ini bootstrap_scenario_hosts.yml
+
+  # 2. The running container is named "lan" (from its docker-compose.yaml's
+  #    service name), NOT "ubuntu-lan" (the directory name) - find its real IP:
+  docker inspect lan --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'
+
+  # 3. Put that IP into hosts.ini's lan-host entry before running site.yml.
+  ```
+  **Taking the scenario-3-only path (`--limit soc-host,dmz-ubuntu`)? Skip all three steps above.** The lateral-movement target IP inside scenario 3's own attack script is fixed at `insider_threat_lan_link_ip` (`172.30.0.3` in `group_vars/all.yml`, the `scenario3-link` network address) — unrelated to `hosts.ini`'s `lan-host` entry. You only need the bootstrap/inspect/refill dance above if you're also running the optional `lan` play (FreeIPA/Nextcloud/Mailcow), which does connect to `lan-host` over SSH for real.
+- **`dmz-ubuntu` and `lan` both run their own *nested* Docker daemon** — this matters for anything you try to debug on them. `roles/juice_shop` (on `dmz-ubuntu`) and `roles/freeipa`/`roles/nextcloud`/`roles/mailcow` (on `lan`) all run `docker compose up -d` *over Ansible's SSH connection, inside the target container itself* — not on the VM/physical host's own Docker. This means:
+  - `docker ps -a` run on the VM/host **never** shows Juice Shop, FreeIPA, Nextcloud, or Mailcow — you have to go one level deeper:
+    ```bash
+    docker exec dmz-ubuntu docker ps -a --format '{{.Names}}\t{{.Status}}'
+    docker exec lan docker ps -a --format '{{.Names}}\t{{.Status}}'
+    ```
+  - The pre-pull / save-transfer-load advice in [§ 3 Deploy all services](#3-deploy-all-services) only reaches the VM/host's **outer** Docker daemon — `docker load` there does nothing for images these nested services need. To get a saved image into the **inner** `lan` (or `dmz-ubuntu`) daemon instead, pipe the save directly into a `docker exec`, skipping the intermediate `.tar` file entirely (verified working against `lan`'s nested daemon on a test VM). Note `dmz-ubuntu`'s own nested Docker daemon doesn't exist until `site.yml`'s first play (`all` — "Install Docker on all hosts") has run against it — see the timing note under § 3 method 2 below:
+    ```bash
+    docker save <image> | docker exec -i lan docker load
+    # or, for dmz-ubuntu's own Juice Shop image:
+    docker save <image> | docker exec -i dmz-ubuntu docker load
+    ```
+- **`dmz-ubuntu/` and `ubuntu-lan/` (their Dockerfile + `docker-compose.yaml`) are not deployed by `site.yml` or any other role in this repo** — if you're using these containers as stand-ins for the external/LAN hosts, prepare the following *before* running anything:
+
+  **`group_vars/soc.yml` and `inventory/hosts.ini` ship with the maintainer's own real environment's values, not a blank template.** `git clone` copies whatever is currently committed - both files are tracked (not gitignored), and on the maintainer's own machine they're additionally marked `git update-index --skip-worktree`, which only suppresses `git status`/`git diff` noise *on that one machine* and has no effect at all on what a fresh clone receives. If you're cloning this fresh, you will get the maintainer's own hostnames/IPs/credentials, not an empty form - overwrite both files with your own values before doing anything else:
+
+  ```bash
+  cp group_vars/soc.yml.example group_vars/soc.yml
+  cp inventory/hosts.ini.example inventory/hosts.ini
+  # Optional, but recommended if you intend to keep working in this clone and
+  # don't want your own real values to accidentally get committed later:
+  git update-index --skip-worktree group_vars/soc.yml inventory/hosts.ini
+  ```
+
+  See [§ Change secrets](#2-change-secrets) below for which `soc.yml` values need a real value before first deploy vs. which are fine to leave as-is.
+
+  `dmz-ubuntu/Dockerfile` and `ubuntu-lan/Dockerfile` both `COPY` an `authorized_keys` file at build time - it's gitignored, so a fresh clone doesn't have one and the image build fails outright without it. This generates an ed25519 keypair, **not** the RSA key `hosts.ini.example`'s `ansible_ssh_private_key_file` points at by default - update that line in your `hosts.ini` to match (done below), rather than generating an RSA key just to match the example file:
+
+  ```bash
+  ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+  cp ~/.ssh/id_ed25519.pub dmz-ubuntu/authorized_keys
+  cp ~/.ssh/id_ed25519.pub ubuntu-lan/authorized_keys
+  ```
+
+  Ansible's own SSH connections to these containers will fail on first contact (`Host key verification failed`) unless `hosts.ini`'s `[all:vars]` sets this (matching what `insider-threat-test/run_attack.sh` already assumes), and `ansible_ssh_private_key_file` must point at the key you just generated above, not `hosts.ini.example`'s default `~/.ssh/id_rsa`:
+
+  ```ini
+  [all:vars]
+  ansible_ssh_private_key_file=~/.ssh/id_ed25519
+  ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+  ```
+
+  With that done, the full order for a from-scratch scenario-3 deployment is:
+  ```bash
+  # 1. Fill in group_vars/soc.yml FIRST (see group_vars/soc.yml.example) - every
+  #    CHANGE_ME must be replaced before running configure_integration.yml, or
+  #    the placeholder gets permanently baked into a live Shuffle workflow
+  #    (see note below).
+  #    dmz_ubuntu_agent_id/dmz_windows_agent_id CANNOT be filled in yet at this
+  #    point - they're assigned by Wazuh at agent registration time, which
+  #    hasn't happened. Leave them as CHANGE_ME for now and come back after step 2.
+
+  ansible-playbook -i inventory/hosts.ini bootstrap_scenario_hosts.yml
+  ansible-playbook -i inventory/hosts.ini site.yml
+
+  # 2. Agents are now registered - look up the real IDs and fill them into
+  #    group_vars/soc.yml before continuing (don't assume example values like
+  #    "007" - a fresh single-agent lab typically registers as "001"):
+  #    docker exec single-node-wazuh.manager-1 /var/ossec/bin/agent_control -l
+
+  ansible-playbook -i inventory/hosts.ini configure_integration.yml                  # imports IRIS/DDoS/USB-DLP workflows - run this even if you only want scenario 3, see note below
+  ansible-playbook -i inventory/hosts.ini deploy_insider_threat_response.yml          # only if using insider-threat-test/
+  ansible-playbook -i inventory/hosts.ini configure_insider_threat_integration.yml    # only if using insider-threat-test/
+
+  # 3. configure_insider_threat_integration.yml just imported the insider-threat
+  #    Shuffle workflow, but does NOT write its assigned IDs back into
+  #    group_vars/soc.yml - Shuffle re-generates these on every import.
+  #    These two IDs aren't read by run_attack.sh or the helper scripts
+  #    (set_force_off_hours.sh/update_shuffle_workflow_ip.sh look up the
+  #    live value instead), so it's fine to leave them as CHANGE_ME. To
+  #    look them up by hand anyway:
+  #    curl -H "Authorization: Bearer <shuffle_default_apikey>" http://<soc-ip>:5001/api/v1/workflows
+  #    -> match by name "Wazuh Insider-Threat Auto-Response", use its "id" for
+  #       shuffle_insider_threat_workflow_id and its triggers[0].id for
+  #       shuffle_insider_threat_webhook_trigger_id
+  ```
+  `bootstrap_scenario_hosts.yml` creates the `dmz-ubuntu_default` and `scenario3-link` networks (both declared `external: true` in `dmz-ubuntu/docker-compose.yaml` — yes, both, even if you only want the plain DDoS/Juice-Shop use of this host and have no interest in scenario 3; see the playbook's own header comment) and builds/starts both containers. It's idempotent - safe to re-run, never recreates an already-running container or touches its volumes. Confirm the subnet it picks matches what `inventory/hosts.ini` expects to SSH into (`docker network inspect dmz-ubuntu_default`).
+
+  ⚠️ **`configure_insider_threat_integration.yml` cannot run standalone** despite scoping itself to "scenario 3 only" - it looks up the *currently active* IRIS/DDoS/USB-DLP Shuffle trigger IDs (deliberately without re-importing them) to wire the shared `custom-shuffle` forwarding script, so those three workflows must already exist. Run `configure_integration.yml` at least once first.
+
+  ⚠️ **Any value baked into a Shuffle workflow or `custom-shuffle.py` at import time is frozen from that point on** - Shuffle stores imported workflow JSON as a static document, it does not re-read `group_vars/soc.yml` later. If you edit `wazuh_indexer_password`, `wazuh_api_password`, `wazuh_server_ip`, `dmz_ubuntu_agent_id`, `dmz_windows_agent_id`, `iris_adm_api_key`, `abuseipdb_api_key`, or `shuffle_default_apikey` *after* already running `configure_integration.yml`/`configure_insider_threat_integration.yml`, the already-imported workflow keeps using the old value - the fix doesn't take effect until you delete that specific workflow in Shuffle and re-run the playbook that imports it. Both playbooks now assert on startup that none of their required values are still `CHANGE_ME`/empty, to catch this before it silently gets baked in - but that only protects the *first* import, not a later edit to an already-deployed value. In particular: if you deploy scenario 3 first and only add the Windows agent later, `dmz_windows_agent_id` was still `CHANGE_ME` when the DDoS/USB-DLP workflows were imported, and filling it in afterward does not retroactively fix them - delete both workflows in Shuffle and re-run `configure_integration.yml` for the real agent ID to take effect.
+
+  ⚠️ Both Dockerfiles bake in a `dev` account with a hardcoded, lab-only password (an SSH key is also baked in and preferred for actual access) — change or remove that password before using either Dockerfile outside a throwaway lab.
+- If a scenario's own setup (e.g. `insider-threat-test/`) requires host-level `auditd`, that specifically needs a real machine or VM for the `soc` host - it cannot run inside a container (no access to the kernel audit netlink socket). See `insider-threat-test/README.md`'s prerequisites.
+
 ---
 
 ## Usage
@@ -124,6 +296,8 @@ Then use the dynamic inventory script for all playbook commands:
 ansible-playbook -i inventory/hosts.py site.yml
 ```
 
+`ANSIBLE_SSH_KEY` only feeds `inventory/hosts.py` (confirmed in that script - its default really is `~/.ssh/id_rsa`, not a doc error). It has **no effect** on the single-machine/scenario-3 path below ("Fresh host/VM setup" + "Single machine simulating 3 hosts"), which uses `-i inventory/hosts.ini` directly throughout - that path's own key comes from `hosts.ini`'s `ansible_ssh_private_key_file` instead (set to `~/.ssh/id_ed25519` there, matching the keypair generated in that section). It also has no effect on `insider-threat-test/run_attack.sh`, which uses a third, separate keypair of its own (`secrets/insider_threat_test_key`, auto-generated idempotently by the `insider_threat_agent_linux` role - nothing to set up manually). If you *are* using Option A's dynamic inventory with an ed25519 key instead of RSA, set `ANSIBLE_SSH_KEY=~/.ssh/id_ed25519` to match.
+
 **Option B — static file:**
 
 Edit `inventory/hosts.ini` directly and use `-i inventory/hosts.ini`.
@@ -132,18 +306,63 @@ All service configs (Wazuh agent → manager IP, Shuffle webhook URLs, etc.) are
 
 ### 2. Change secrets
 
-**Required before deploy** — edit `group_vars/soc.yml`:
+**`group_vars/soc.yml` is not gitignored - it's a tracked file with real values currently committed to history (clean that up / rotate those values before treating this repo as shareable).** Copy `group_vars/soc.yml.example` to `group_vars/soc.yml` and `inventory/hosts.ini.example` to `inventory/hosts.ini` for a fresh checkout, and run `git update-index --skip-worktree group_vars/soc.yml inventory/hosts.ini` before filling in your own values so they don't get committed.
+
+None of `soc.yml`'s ~28 variables have an Ansible-level default (no `defaults/main.yml`, no `| default(...)` anywhere) - every one of them must have *some* string or template rendering fails outright. Whether that string needs to be a real, working value, or whether the `.example` placeholder is fine to leave as-is, differs per variable:
+
+**Choose a real value before first deploy - the respective container adopts it as its actual credential at boot** (confirmed in `roles/shuffle/templates/docker-compose.yml.j2` / `roles/dfir_iris/templates/docker-compose.yml.j2` - these are plain container env vars, nothing generates them after the fact and writes them back):
 
 | Variable | Description |
 |---|---|
+| `shuffle_admin_username` / `shuffle_admin_password` | Shuffle UI login |
 | `shuffle_default_apikey` | Shuffle API key (min 36 chars) |
 | `iris_adm_api_key` | DFIR-IRIS admin API key (min 36 chars); embedded into the Shuffle workflow so Shuffle can call the IRIS API |
 | `iris_admin_password` | DFIR-IRIS web UI password |
 | `iris_secret_key` | Flask secret key (min 32 chars) |
+| `iris_db_password`, `iris_rabbitmq_user` / `iris_rabbitmq_password` | IRIS's own Postgres/RabbitMQ credentials |
+
+⚠️ **`wazuh_api_user` / `wazuh_api_password` and `wazuh_indexer_user` / `wazuh_indexer_password` are two pairs that look like the above but AREN'T - do not change these from the `.example` values, which are deliberately filled in with the matching upstream defaults, not `CHANGE_ME`.** `roles/wazuh_server/templates/wazuh.yml.j2` hardcodes the Wazuh dashboard's `wazuh-wui` API credential as a literal string (confirmed: Wazuh's own upstream `wazuh-docker` single-node default), and that same project's `docker-compose.yml` (cloned verbatim by `roles/wazuh_server/tasks/main.yml`) separately hardcodes its own `INDEXER_PASSWORD` the same way - neither is actually set from `soc.yml`, despite both having an entry here. But the DDoS/USB-DLP/insider-threat Shuffle workflows *do* build their Basic Auth headers for calling the Wazuh API and indexer from `soc.yml`'s copies of these four values. If you "secure" these per the usual instinct, every Active Response dispatch and indexer history lookup in those workflows silently starts failing auth against the real manager/indexer, because nothing changed the manager's/indexer's actual password to match. Leave these as the `.example` values - if you do need to rotate them for a non-lab deployment, change the hardcoded copy in `wazuh.yml.j2` (and the upstream `wazuh-docker` compose for the indexer one) at the same time, not just here.
+
+**Fine to leave as the `.example` placeholder, no known functional impact either way:**
+
+| Variable | Why |
+|---|---|
+| `iris_version` | Already a real, working image tag |
+| `wazuh_alert_min_level` | Numeric threshold; the `.example` default (7) is what this repo's own rule design assumes |
+| `wazuh_manager_host_conf` | Path template, correct as long as `deploy_base_dir` matches your install |
+| `soc_notify_email` | **Dead variable - grepped the whole repo, nothing reads it.** Originally meant for a NOTIFY_SOC email step that was never wired up. |
+
+**Scenario-specific** (only matters if you're deploying that particular add-on scenario - see each scenario's own setup notes):
+
+| Variable | Scenario |
+|---|---|
+| `abuseipdb_api_key`, `shuffle_ddos_workflow_id` / `shuffle_ddos_webhook_trigger_id` | DDoS |
+| `shuffle_usb_dlp_workflow_id` / `shuffle_usb_dlp_webhook_trigger_id` | USB-DLP |
+| `shuffle_insider_threat_workflow_id` / `shuffle_insider_threat_webhook_trigger_id` | Insider-threat (`insider-threat-test/`) |
+| `dmz_windows_agent_id` | DDoS + USB-DLP (Windows AR target) |
+| `dmz_ubuntu_agent_id` | DDoS + Insider-threat (Linux AR target) |
+| `wazuh_indexer_url`/`user`/`password` | DDoS + Insider-threat only (USB-DLP uses a Shuffle cache instead of querying the indexer) |
+
+⚠️ **`configure_integration.yml` requires `abuseipdb_api_key` to be set even if you only want scenario 3 (insider-threat) and have no interest in DDoS.** This playbook unconditionally imports the IRIS/DDoS/USB-DLP workflows every time it runs — there's no flag to import only some of them — so its pre-flight assert checks `abuseipdb_api_key` regardless of which scenario you actually care about. If you don't plan to use DDoS: **any non-empty value that is not literally the string `CHANGE_ME` satisfies the assert** (e.g. `scenario3-unused`) — the assert never validates that the key is a real, working AbuseIPDB credential, only that it isn't the literal placeholder. Keep in mind this placeholder gets baked into the DDoS workflow's AbuseIPDB-lookup node at import time (same "frozen at import" caveat as the warning box below) — if you later want real DDoS functionality, you must delete that workflow in Shuffle and re-run `configure_integration.yml` after setting a real key, filling it in afterward does not retroactively fix the already-imported copy.
+
+**Genuinely only knowable after a first deploy** (Shuffle re-generates UUIDs on import; agent IDs are assigned at registration time - leave the `.example` placeholder for the very first run, then fill in for real): `shuffle_workflow_id`/`shuffle_webhook_trigger_id` and all the other `shuffle_*_workflow_id`/`*_webhook_trigger_id` pairs (the insider-threat pair can be left as-is — see step 3 above), `dmz_windows_agent_id`, `dmz_ubuntu_agent_id`.
 
 Also review `group_vars/lan.yml` for FreeIPA, Nextcloud, and Mailcow passwords.
 
 Optionally change the domain (default `example.lab`) in `group_vars/all.yml`.
+
+> ⚠️ **Do not run `site.yml` against a machine that already has a working deployment on it using a *different* `soc.yml` than what's currently live.** `docker compose up -d` (used by every service role here) recreates any container whose rendered config changed - if your `soc.yml` differs from what the running containers were last deployed with, this will restart Wazuh/Shuffle/IRIS etc. with new credentials that may not match what's already inside their databases/volumes. **Confirmed live, not just a theoretical risk**: changing `iris_db_password` in `soc.yml` and re-running `site.yml` after DFIR-IRIS had already initialized with the old value recreated `iriswebapp_app`/`iriswebapp_worker` with the new password, while Postgres (a stateful service - its own init scripts only run once, against an empty data directory) kept the old one - every subsequent app connection failed with `password authentication failed for user "iris"` until the affected volume was removed and the service reinitialized from scratch. No `--force-recreate`/`-v` flags are used, so this does not delete a volume outright by itself - but a credential mismatch like this makes the existing data inaccessible through the app layer just the same, which is practically no better.
+>
+> This can happen to **any** of these services' own stateful data, not just IRIS's Postgres - each one's first-boot init is a one-time event, and a container recreate afterward only changes what the *new* container's env vars say, never what's already stored inside the volume:
+>
+> | Service | Volume | Driven by (in `soc.yml`) |
+> |---|---|---|
+> | DFIR-IRIS Postgres | `dfir-iris_iris-db-data` | `iris_db_password`, `iris_admin_password`, `iris_secret_key` |
+> | DFIR-IRIS RabbitMQ | `dfir-iris_iris-rabbitmq-data` | `iris_rabbitmq_password` |
+> | Shuffle (admin user + API key, stored in its OpenSearch backing store) | `shuffle_shuffle-opensearch-data` | `shuffle_admin_password`, `shuffle_default_apikey` |
+> | Wazuh indexer | `single-node_wazuh-indexer-data` | *not* driven by `soc.yml`'s `wazuh_indexer_password` at all - the upstream `wazuh-docker` compose hardcodes its own value, see the note on `wazuh_api_password`/`wazuh_indexer_password` above |
+>
+> If you need to change one of these values after the first deploy, remove that specific volume (`docker compose down` the relevant stack first, then `docker volume rm <name>`, **not** `-v` on the whole stack, which would take out volumes you didn't mean to touch) and re-run `site.yml` to let it reinitialize clean.
 
 ### 3. Deploy all services
 
@@ -155,7 +374,61 @@ This runs four plays in order:
 1. **all** — install Docker CE on every host
 2. **soc** — Wazuh server, Shuffle, DFIR-IRIS
 3. **external** — Wazuh agent, Juice Shop
-4. **lan** — Wazuh agent, FreeIPA, Nextcloud, Mailcow
+4. **lan** — Wazuh agent, FreeIPA, Nextcloud, Mailcow (**optional** — see below)
+
+**The `lan` play (FreeIPA/Nextcloud/Mailcow) isn't needed by scenarios 1–3** — none of their roles, scripts, or Shuffle workflows reference `lan-host` as a Wazuh agent or dependency. That said, **scenario 3 is the only one actually run end-to-end via `--limit soc-host,dmz-ubuntu`** — the other two have their own caveats if you want to use this exact limit:
+- **Scenario 1 (DDoS)** has a Linux-DMZ path (`deploy_dmz_ubuntu_nginx.yml` + `deploy_ddos_response.yml`'s `soc` play) fully covered by `--limit soc-host,dmz-ubuntu`, plus a separate Windows-DMZ Active Response path (`deploy_ddos_response.yml`'s second play, `roles/nginx_dmz_windows`) that isn't.
+- **Scenario 2 (USB-DLP) requires a Windows DMZ host** — `deploy_usb_dlp_response.yml`'s second play targets `dmz-windows` specifically via `roles/usb_dlp_agent_windows`, and there's no Linux equivalent. `--limit soc-host,dmz-ubuntu` excludes Windows entirely, so it does not cover scenario 2 on its own.
+
+A dry-run shows the `lan` play dropping to zero hosts under the limit (nothing actually executed):
+```bash
+ansible-playbook -i inventory/hosts.ini site.yml --limit soc-host,dmz-ubuntu --list-hosts
+#   play #1 (all): hosts (2): dmz-ubuntu, soc-host
+#   play #2 (soc): hosts (1): soc-host
+#   play #3 (external): hosts (1): dmz-ubuntu
+#   play #4 (lan): hosts (0):            <- correctly empty
+```
+To actually skip it, add `--limit soc-host,dmz-ubuntu` to the real `ansible-playbook -i inventory/hosts.ini site.yml` command. `site.yml` has no tags defined (`--tags` won't do anything here), so `--limit` against the relevant host names is the only lever available.
+
+**If you do want the `lan` play (FreeIPA/Nextcloud/Mailcow), budget for it separately — it's the least reliable, least documented part of this repo:**
+- It needs its own stable outbound network access and meaningfully more disk than scenarios 1–3 alone (Mailcow's upstream project alone declares 18 of its own container images).
+- `roles/mailcow/tasks/main.yml`'s `git clone` of `mailcow-dockerized` has **no pinned version** (no `version:`/tag/commit) — it tracks whatever that upstream project's default branch HEAD is at the moment you run it, so its own image list, versions, and behavior can all change out from under this repo without warning, and are not reproducible between two runs on different days.
+- FreeIPA is currently known to fail outright in this containerized environment (server-side install completes, but the image's own client-side `ipa-client-install` step fails with a Kerberos/SPNEGO error, root cause not identified). It loops `restart: unless-stopped` indefinitely. This is non-fatal to the rest of the play — `roles/freeipa/tasks/main.yml`'s own wait task is deliberately `failed_when: false` (up to ~15 minutes of retries) specifically so it doesn't block Nextcloud/Mailcow — but expect `site.yml` to sit through that wait if you include this play.
+
+  ⚠️ **This restart loop is not just a time cost — on a test VM it grew `lan`'s own container disk footprint to ~60GB or more over about a day of uptime** (`docker ps -s` reported `lan`'s writable layer at 67.1GB; a direct `du` on the underlying overlay snapshot directory measured ~62-63GB for the same thing at roughly the same time — the two tools account for it slightly differently; treat both readings as the same finding, not a discrepancy). Likely cause (reasoned from what was observed, not directly proven): `roles/common` sets nested Docker's storage driver to `vfs` (no layer deduplication), and each FreeIPA crash/restart cycle appears to leave behind a new, never-reclaimed ~0.9-1.4GB copy of its root filesystem — over a day of uptime, dozens of these accumulated to tens of GB. If you hit this, you can stop the loop:
+  ```bash
+  docker exec lan docker stop freeipa
+  ```
+  This specific command and its effect were not re-verified live after the disk filled up (the same disk-full state blocks `docker exec` into `lan` at all). Reasoning from the role's own task definition rather than a live test: `roles/freeipa/tasks/main.yml` deploys via a plain `docker compose up -d` (no `--no-recreate`), so a stopped/`docker update --restart=no` container will likely get recreated — and the restart loop will resume — the next time `site.yml` or this role runs again, since compose will see the live config drift from `restart: unless-stopped` and reconcile it. Treat `docker stop`/`docker update --restart=no` as a temporary mitigation between runs, not a permanent fix.
+
+  ⚠️ **If the disk actually does fill up, three separate things break and none of them recover on their own once space is freed again** — confirmed live on a test VM after the growth above ran the disk to 100%:
+  - **Symptoms**: attack-simulation commands (`insider-threat-test/run_attack.sh`) run and complete normally, but Active Response never fires; Shuffle stops processing new executions entirely; `curl` to Shuffle's own API (port 5001) gets `connection refused`.
+  - **Quick checks**:
+    ```bash
+    df -h /                                              # is it actually full?
+    stat -c '%y' /var/log/audit/audit.log                # host auditd - last write time far in the past means it's not logging
+    docker exec shuffle-opensearch curl -s http://localhost:9200/_cluster/health   # look for "status":"red"
+    ```
+  - **auditd silently self-suspends on a full disk and does not resume on its own once space is freed.** This is the Ubuntu `auditd` package's own stock default (`disk_full_action = SUSPEND` in `/etc/audit/auditd.conf`) — this repo's `insider_threat_host_audit` role only installs the package and its detection rules, it never touches this setting. `systemctl status auditd` still shows `active (running)` throughout (the daemon doesn't crash, it just stops writing), which makes this easy to miss. This runs on the SOC host itself (`roles/insider_threat_host_audit` targets `hosts: soc`, `ansible_connection=local`), not inside `dmz-ubuntu` - auditd can't run inside a container at all (no kernel audit netlink access), which is exactly why it's installed on the host and `/var/log/audit` is bind-mounted read-only into `dmz-ubuntu` instead.
+  - **Fix, in this order** (OpenSearch and Shuffle first, since the disk filling in the first place is what breaks them; auditd last since it's independent of the other two):
+    ```bash
+    # 1. Clear OpenSearch's read-only block from the full-disk watermark, then
+    #    retry shard allocation (run on the VM/host, against the Shuffle OpenSearch container):
+    docker exec shuffle-opensearch curl -s -X PUT "http://localhost:9200/_all/_settings" \
+      -H "Content-Type: application/json" -d '{"index.blocks.read_only_allow_delete": null}'
+    docker exec shuffle-opensearch curl -s -X POST "http://localhost:9200/_cluster/reroute?retry_failed=true"
+    # Confirm status is "yellow" (not "red") before continuing - "yellow" with
+    # unassigned replica shards is normal for a single-node cluster.
+
+    # 2. Restart Shuffle's backend so it reconnects and starts accepting
+    #    requests on port 5001 again (run on the VM/host's outer Docker):
+    docker restart shuffle-backend
+
+    # 3. Restart auditd so it resumes writing (run on the VM/host itself, not
+    #    inside any container):
+    sudo systemctl restart auditd
+    ```
+  - **Prevention**: check available disk (`df -h /`) before starting a deploy, not just before running the optional `lan` play - all three of the above can be triggered by any source of disk pressure, not just FreeIPA's restart loop.
 
 **Windows DMZ external host?** Skip the `external` play in `site.yml` and run the dedicated Windows playbook instead — it installs Juice Shop as a Windows service via NSSM and the Wazuh agent via MSI, configures the firewall, and registers the agent with the manager:
 
@@ -170,6 +443,71 @@ ansible-playbook -i inventory/hosts.ini deploy_soc_remaining.yml
 ```
 
 > No Ansible at all on the Windows side? Run `windows-dmz/setup-dmz.ps1` directly on the DMZ host as Administrator — it does the same install via Chocolatey + Docker Desktop.
+
+**Docker Hub / ghcr.io pull failures.** The `soc` play alone pulls several multi-GB images (Wazuh manager/indexer/dashboard, Shuffle frontend/backend/orborus + OpenSearch, DFIR-IRIS app/nginx/db + RabbitMQ). On a slow or flaky connection, `docker compose up -d` inside these roles can fail partway through with `read: connection reset by peer` - confirmed to be general network/registry flakiness, not something these roles do wrong (retrying the same `ansible-playbook` command resumes from already-pulled layers, since neither Docker nor these roles delete a partial pull). Three ways to deal with it, roughly in order of effort:
+
+1. **Just retry.** Re-run the same `ansible-playbook -i inventory/hosts.ini site.yml` command. Layers already fully downloaded are not re-fetched.
+2. **Pre-pull before running Ansible at all**, so the whole multi-image pull isn't riding on one `docker compose up -d` call's retry budget. **The list below is scoped to the scenario 3 path** (`--limit soc-host,dmz-ubuntu`, skipping the optional `lan` play entirely — see above) — cross-checked by grepping every `image:` line across `roles/*/templates/*.j2`, the upstream `wazuh-docker` compose, and this repo's own `dmz-ubuntu` Dockerfile, split by which Docker daemon actually needs to pull it, since (see [§ Single machine simulating 3 hosts](#single-machine-simulating-3-hosts-vs-3-real-hosts) above) `dmz-ubuntu` runs its own *nested* Docker daemon, separate from the VM/host's own. **Sizes below are approximate, taken from `docker images` on the day this was tested — they'll drift as images get updated upstream, treat them as a rough budget, not an exact figure:**
+
+   **VM/host's own (outer) Docker — `soc` play:**
+   ```bash
+   docker pull wazuh/wazuh-manager:4.9.2            # ~2.0GB
+   docker pull wazuh/wazuh-indexer:4.9.2            # ~4.2GB
+   docker pull wazuh/wazuh-dashboard:4.9.2          # ~1.8GB
+   docker pull wazuh/wazuh-certs-generator:0.0.2    # ~218MB - NOT in the upstream wazuh-docker compose templated by this repo; pulled on-demand by wazuh-docker's own generate-indexer-certs.yml the first time wazuh_server's role runs it. Missing this one specifically is what makes the very first site.yml run fail with no obvious image name to go chase.
+   docker pull ghcr.io/shuffle/shuffle-frontend:latest   # ~275MB
+   docker pull ghcr.io/shuffle/shuffle-backend:latest    # ~188MB
+   docker pull ghcr.io/shuffle/shuffle-orborus:latest    # ~163MB
+   docker pull ghcr.io/shuffle/shuffle-worker:latest     # ~173MB - a core Shuffle component alongside frontend/backend/orborus, easy to miss since it's not in roles/shuffle/templates/docker-compose.yml.j2 at all (Shuffle's own orborus container spawns it)
+   docker pull opensearchproject/opensearch:2.12.0       # ~2.2GB
+   docker pull ghcr.io/dfir-iris/iriswebapp_app:v2.4.18   # ~1.9GB - both iriswebapp_app AND iriswebapp_worker use this same image, just a different command - no separate pull needed for the worker
+   docker pull ghcr.io/dfir-iris/iriswebapp_nginx:v2.4.18 # ~313MB
+   docker pull ghcr.io/dfir-iris/iriswebapp_db:v2.4.18    # ~381MB - DFIR-IRIS's own Postgres image, not a vanilla postgres:xx
+   docker pull rabbitmq:3-management                      # ~392MB - the plain upstream Docker Hub image, not ghcr.io-hosted
+   ```
+   ⚠️ The `ghcr.io/shuffle/*:latest` images are **not version-pinned** - whatever you pull here may not match the exact build this doc was last verified against. If something Shuffle-related behaves differently than described elsewhere in this README, check `docker image inspect <image> --format '{{.Created}}'` before assuming it's a bug in these roles.
+
+   **Shuffle also pulls additional app images *at workflow-execution time*, not at deploy time** — confirmed present on a test VM after running the DDoS/insider-threat workflows a few times: `frikky/shuffle:app_sdk`, `frikky/shuffle:shuffle-tools_1.2.0`, `frikky/shuffle:http_1.4.0`, `frikky/shuffle:email_1.3.0`, `frikky/shuffle:shuffle-subflow_1.1.0`, `frikky/shuffle:shufflehealthcheck_1.1.0`, `frikky/shuffle:tenzir`. The exact tags above are what was observed on the day this was tested and may change later - there's no fixed, pinned list to point at. If your network is unreliable, pre-pulling these on the outer Docker daemon avoids the first workflow execution being the moment you discover a pull failure:
+   ```bash
+   docker pull frikky/shuffle:app_sdk
+   docker pull frikky/shuffle:shuffle-tools_1.2.0
+   docker pull frikky/shuffle:http_1.4.0
+   docker pull frikky/shuffle:email_1.3.0
+   docker pull frikky/shuffle:shuffle-subflow_1.1.0
+   docker pull frikky/shuffle:shufflehealthcheck_1.1.0
+   docker pull frikky/shuffle:tenzir
+   ```
+
+   **Locally-built images' own base layer:**
+   ```bash
+   docker pull ubuntu:24.04   # dmz-ubuntu/Dockerfile and ubuntu-lan/Dockerfile both FROM this - pulled automatically by `docker compose build`, but worth having cached up front
+   ```
+
+   **`dmz-ubuntu`'s own nested Docker — `external` play (Juice Shop):** `dmz-ubuntu/Dockerfile` does not install Docker itself (confirmed by reading it — only systemd/ssh/python3/sudo); Docker CE inside `dmz-ubuntu` is installed by `roles/common`, i.e. `site.yml`'s first play (`all` — "Install Docker on all hosts"). This means `docker exec dmz-ubuntu docker ...` does not work yet right after `bootstrap_scenario_hosts.yml` — only after `site.yml` has gotten through its first play for `dmz-ubuntu`. In practice, pre-loading before the `external` play even tries to pull Juice Shop isn't something you can cleanly do standalone; the straightforward path is: run `site.yml`, and if the Juice Shop pull in the `external` play fails, load the image into `dmz-ubuntu`'s now-existing nested daemon and re-run `site.yml` (per method 1 above — already-done work isn't redone):
+   ```bash
+   docker pull bkimminich/juice-shop:latest   # size not checked
+   docker save bkimminich/juice-shop:latest | docker exec -i dmz-ubuntu docker load
+   ```
+3. **Pull on a machine with a working connection, then import on the target** (what was actually necessary in testing, when the pulling machine's own network was the bottleneck - not specific to any of these images or to Docker/Ansible):
+   ```bash
+   # On the machine that CAN reach the registry, for images the VM/host's own
+   # (outer) daemon needs:
+   docker save -o wazuh-manager.tar wazuh/wazuh-manager:4.9.2
+   # ...repeat per image, then copy the .tar file(s) to the target host, then:
+   docker load -i wazuh-manager.tar
+   ```
+   Confirm the loaded image's ID matches the source machine's (`docker image inspect <image> --format '{{.Id}}'`) before trusting it's the exact same build.
+
+   For the image the **nested** `dmz-ubuntu` daemon needs (Juice Shop), `docker load` alone doesn't help — see method 2 above for the `docker save | docker exec -i dmz-ubuntu docker load` piping approach and its timing caveat (nested Docker doesn't exist there until `site.yml`'s first play has run). If you're also deploying the optional `lan` play, the same technique applies to its nested daemon (`docker exec -i lan docker load`) for FreeIPA/Nextcloud/Mailcow's images — see the warning about that play above for why this doc doesn't give those a fixed image list.
+
+**Long-running commands (`site.yml` especially can take 20+ minutes with these many images).** As a precaution, avoid plain `nohup CMD &` in a terminal you might disconnect from — if the session underneath it closes, the backgrounded process can be torn down along with it before it finishes. `tmux`/`screen`, or `sudo systemd-run` for a one-off transient unit that isn't tied to any login session, are both safer for anything you intend to let run unattended:
+```bash
+sudo systemd-run --unit=site-deploy --uid=$(id -u) --gid=$(id -g) \
+  --working-directory="$PWD" \
+  -p StandardOutput=append:/tmp/site-deploy.log -p StandardError=inherit \
+  -- "$(which ansible-playbook)" -i inventory/hosts.ini site.yml
+```
+`--uid`/`--gid` matter — without them `systemd-run` runs the command as `root`, which has its own home directory (no SSH key, no `~/.ansible` state) rather than the user whose key/config you set all this up under.
 
 ### 4. Wire up the alert pipeline
 
